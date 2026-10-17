@@ -29,6 +29,7 @@ Key Features:
        Dawn (06 LT) at Right, Dusk (18 LT) at Left (configurable via `--noon top` or `--noon bottom`).
      - Earth boundary circle at R <= 1 R_E and adaptive radial distance rings.
      - User-controllable point size (`--point-size`) for thin, razor-sharp orbit curves.
+     - 15-minute fixed cadence polar orbit sampling without point count limit (`--interval 15.0`).
   5. High-Performance Direct CDF Parsing & Auto-Download:
      - Discovers local THEMIS CDF files or downloads missing files via pyspedas.
      - Parses CDFs directly via `cdflib` for maximum speed and robustness.
