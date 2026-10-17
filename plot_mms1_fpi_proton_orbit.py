@@ -279,7 +279,7 @@ def load_mms_fpi_and_orbit(fpi_files, mec_files, probe='1', coord='gse',
     # -------------------------------------------------------------------------
     fpi_epochs_list = []
     fpi_flux_list = []
-    fpi_energies = None
+    fpi_energy_list = []
 
     spec_var_name = f'mms{probe}_dis_energyspectr_omni_fast'
     energy_var_name = f'mms{probe}_dis_energy_fast'
@@ -318,26 +318,30 @@ def load_mms_fpi_and_orbit(fpi_files, mec_files, probe='1', coord='gse',
 
             # Resolve energy
             en_var = next((v for v in [energy_var_name, 'mms1_dis_energy_fast'] if v in zvars), None)
-            if en_var and fpi_energies is None:
-                raw_en = cdf.varget(en_var)
-                if raw_en is not None and np.size(raw_en) > 0:
-                    raw_en = np.asarray(raw_en, dtype=np.float64)
-                    if raw_en.ndim == 2:
-                        fpi_energies = raw_en[0]
-                    elif raw_en.ndim == 1:
-                        fpi_energies = raw_en
-
-            # Validate record counts match
-            if len(u_sec) != fl.shape[0]:
-                print(f"[Parser] Warning: Skipping {os.path.basename(f)} due to mismatch between Epoch ({len(u_sec)}) and Flux ({fl.shape[0]}).")
+            if not en_var:
+                continue
+            raw_en = cdf.varget(en_var)
+            if raw_en is None or np.size(raw_en) == 0:
+                continue
+            raw_en = np.asarray(raw_en, dtype=np.float64)
+            if raw_en.ndim == 1:
+                en_file = np.tile(raw_en, (len(u_sec), 1))
+            elif raw_en.ndim == 2:
+                if raw_en.shape[0] == len(u_sec):
+                    en_file = raw_en
+                else:
+                    en_file = np.tile(raw_en[0], (len(u_sec), 1))
+            else:
                 continue
 
-            if fpi_energies is not None and fl.shape[1] != len(fpi_energies):
-                print(f"[Parser] Warning: Skipping {os.path.basename(f)} due to energy bins mismatch ({fl.shape[1]} vs {len(fpi_energies)}).")
+            # Validate record counts match
+            if len(u_sec) != fl.shape[0] or len(u_sec) != en_file.shape[0]:
+                print(f"[Parser] Warning: Skipping {os.path.basename(f)} due to mismatch: epoch={len(u_sec)}, flux={fl.shape[0]}, en={en_file.shape[0]}")
                 continue
 
             fpi_epochs_list.append(u_sec)
             fpi_flux_list.append(fl)
+            fpi_energy_list.append(en_file)
         except Exception as e:
             print(f"[Parser] Warning: Skipping corrupted or unreadable FPI file {f}: {e}")
 
@@ -346,11 +350,13 @@ def load_mms_fpi_and_orbit(fpi_files, mec_files, probe='1', coord='gse',
 
     all_fpi_epoch = np.concatenate(fpi_epochs_list)
     all_fpi_flux = np.concatenate(fpi_flux_list, axis=0)
+    all_fpi_energy = np.concatenate(fpi_energy_list, axis=0)
 
     # Sort in chronological order if needed
     sort_idx = np.argsort(all_fpi_epoch)
     all_fpi_epoch = all_fpi_epoch[sort_idx]
     all_fpi_flux = all_fpi_flux[sort_idx]
+    all_fpi_energy = all_fpi_energy[sort_idx]
 
     # Clean fill values and non-physical values
     all_fpi_flux[all_fpi_flux <= 0] = np.nan
@@ -487,6 +493,7 @@ def load_mms_fpi_and_orbit(fpi_files, mec_files, probe='1', coord='gse',
         times_num = times_num[fpi_mask]
         all_fpi_epoch = all_fpi_epoch[fpi_mask]
         all_fpi_flux = all_fpi_flux[fpi_mask]
+        all_fpi_energy = all_fpi_energy[fpi_mask]
         fpi_r = fpi_r[fpi_mask]
         fpi_lt = fpi_lt[fpi_mask]
 
@@ -518,7 +525,7 @@ def load_mms_fpi_and_orbit(fpi_files, mec_files, probe='1', coord='gse',
         'times_num': times_num,
         'raw_epoch': all_fpi_epoch,
         'flux': all_fpi_flux,            # Shape: (N_time, 32)
-        'energy': fpi_energies,          # Shape: (32,) in eV
+        'energy': all_fpi_energy,        # Shape: (N_time, 32) in eV (handles time-varying energy tables)
         'r_re': fpi_r,                   # Radial distance in R_E at FPI times
         'lt': fpi_lt,                    # Local Time (GSE LT or GSM MLT) in hours [0, 24)
         'mlt': fpi_lt,                   # Backward compatibility alias
@@ -536,26 +543,48 @@ def load_mms_fpi_and_orbit(fpi_files, mec_files, probe='1', coord='gse',
 def extract_flux_at_energy(energy_eV, flux_2d, target_energy_eV):
     """
     Extracts an ion flux slice at target_energy_eV using log-log interpolation across energy bins.
+    Supports dynamic time-varying energy tables (2D energy array).
     """
     n_times = flux_2d.shape[0]
-    flux_target = np.full(n_times, np.nan)
-
-    log_e_grid = np.log10(energy_eV)
+    flux_target = np.full(n_times, np.nan, dtype=np.float64)
     log_target_e = np.log10(target_energy_eV)
+    is_2d = (energy_eV.ndim == 2)
 
     for i in range(n_times):
-        f_row = flux_2d[i, :]
-        valid = np.isfinite(f_row) & (f_row > 0)
+        e_row = energy_eV[i] if is_2d else energy_eV
+        f_row = flux_2d[i]
+        valid = np.isfinite(e_row) & np.isfinite(f_row) & (f_row > 0) & (e_row > 0)
         if np.sum(valid) >= 2:
-            f_log_interp = interp1d(
-                log_e_grid[valid],
-                np.log10(f_row[valid]),
-                bounds_error=False,
-                fill_value=np.nan
-            )
-            flux_target[i] = 10.0 ** f_log_interp(log_target_e)
+            e_sub = e_row[valid]
+            f_sub = f_row[valid]
+            s = np.argsort(e_sub)
+            flux_target[i] = 10.0 ** np.interp(log_target_e, np.log10(e_sub[s]), np.log10(f_sub[s]))
 
     return flux_target
+
+
+def regrid_spectrogram_on_fixed_energy(yaxis_eV, flux_2d, common_energy_eV):
+    """
+    Interpolates each spectrum row onto a fixed master logarithmic energy grid.
+    Handles dynamic time-varying energy tables across files (e.g. Survey mode vs Solar Wind mode).
+    """
+    n_times = flux_2d.shape[0]
+    n_e = len(common_energy_eV)
+    log_common_e = np.log10(common_energy_eV)
+    regridded = np.full((n_times, n_e), np.nan, dtype=np.float64)
+    is_2d = (yaxis_eV.ndim == 2)
+
+    for i in range(n_times):
+        e_row = yaxis_eV[i] if is_2d else yaxis_eV
+        f_row = flux_2d[i]
+        valid = np.isfinite(e_row) & np.isfinite(f_row) & (f_row > 0) & (e_row > 0)
+        if np.sum(valid) >= 2:
+            e_val = e_row[valid]
+            f_val = f_row[valid]
+            s = np.argsort(e_val)
+            regridded[i, :] = 10.0 ** np.interp(log_common_e, np.log10(e_val[s]), np.log10(f_val[s]))
+
+    return regridded
 
 
 def plot_mms1_fpi_and_orbit(data_dict,
@@ -636,13 +665,24 @@ def plot_mms1_fpi_and_orbit(data_dict,
         lt_orbit = lt[::stride]
         r_orbit = r_re[::stride]
         flux_orbit = flux[::stride]
+        energy_orbit = energy_eV[::stride] if (energy_eV.ndim == 2) else energy_eV
     else:
         lt_orbit = lt
         r_orbit = r_re
         flux_orbit = flux
+        energy_orbit = energy_eV
 
-    print(f"[Plotting] Extracting ion flux slice at ~{target_energy_keV:.2f} keV ({len(lt_orbit)} points)...")
-    flux_slice = extract_flux_at_energy(energy_eV, flux_orbit, target_energy_eV)
+    print(f"[Plotting] Extracting ion flux slice at ~{target_energy_keV:.2f} keV ({len(lt_orbit)} points, dynamic energy tables)...")
+    flux_slice = extract_flux_at_energy(energy_orbit, flux_orbit, target_energy_eV)
+
+    # -------------------------------------------------------------------------
+    # Regrid onto Common Master Energy Grid for Spectrogram
+    # Handles dynamic energy tables across files (e.g. Survey mode vs Solar Wind mode)
+    # -------------------------------------------------------------------------
+    master_energy_eV = np.logspace(np.log10(2.0), np.log10(30000.0), 64)
+    e_grid_keV = master_energy_eV / 1000.0
+    print(f"[Plotting] Regridding {len(times_num)} spectra onto common master energy grid ({len(master_energy_eV)} channels)...")
+    regridded_flux = regrid_spectrogram_on_fixed_energy(energy_eV, flux, master_energy_eV)
 
     # -------------------------------------------------------------------------
     # Uniform Time-Grid Resampling for Spectrogram (Handling Data Gaps cleanly)
@@ -653,13 +693,12 @@ def plot_mms1_fpi_and_orbit(data_dict,
     t_grid_num = np.arange(x_min, x_max + grid_dt_num, grid_dt_num)
     n_grid_times = len(t_grid_num)
 
-    e_grid_keV = energy_eV / 1000.0
-    flux_grid = np.full((n_grid_times, len(energy_eV)), np.nan)
+    flux_grid = np.full((n_grid_times, len(master_energy_eV)), np.nan)
 
-    # Bin raw measurements onto uniform time grid
+    # Bin regridded measurements onto uniform time grid
     bin_indices = np.digitize(times_num, t_grid_num) - 1
-    for k in range(len(energy_eV)):
-        col_flux = flux[:, k]
+    for k in range(len(master_energy_eV)):
+        col_flux = regridded_flux[:, k]
         valid = np.isfinite(col_flux) & (col_flux > 0)
         if np.any(valid):
             b_valid = bin_indices[valid]

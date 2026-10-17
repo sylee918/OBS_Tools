@@ -176,20 +176,24 @@ def find_local_mms_files(calendar_dates, probe='1', data_dir=None):
 def extract_flux_at_energy(energy_eV, flux_2d, target_energy_eV):
     """
     Log-log interpolation across energy channels for each time step.
+    Supports time-varying energy tables (e.g. Survey mode vs Solar Wind mode).
+    energy_eV: shape (N, 32) or (32,)
+    flux_2d: shape (N, 32)
     """
     n_times = flux_2d.shape[0]
-    flux_target = np.full(n_times, np.nan)
-    log_target = np.log10(target_energy_eV)
-    log_energy = np.log10(energy_eV)
+    flux_target = np.full(n_times, np.nan, dtype=np.float64)
+    log_target_e = np.log10(target_energy_eV)
+    is_2d = (energy_eV.ndim == 2)
 
-    valid_mask = np.isfinite(flux_2d) & (flux_2d > 0)
     for i in range(n_times):
-        v = valid_mask[i]
-        if np.sum(v) >= 2:
-            e_sub = log_energy[v]
-            f_sub = np.log10(flux_2d[i, v])
+        e_row = energy_eV[i] if is_2d else energy_eV
+        f_row = flux_2d[i]
+        valid = np.isfinite(e_row) & np.isfinite(f_row) & (f_row > 0) & (e_row > 0)
+        if np.sum(valid) >= 2:
+            e_sub = e_row[valid]
+            f_sub = f_row[valid]
             s = np.argsort(e_sub)
-            flux_target[i] = 10.0 ** np.interp(log_target, e_sub[s], f_sub[s])
+            flux_target[i] = 10.0 ** np.interp(log_target_e, np.log10(e_sub[s]), np.log10(f_sub[s]))
 
     return flux_target
 
@@ -208,7 +212,7 @@ def load_and_process_mms_data(fpi_files, mec_files, target_energies_keV,
     print(f"[Parser] Reading {len(fpi_files)} FPI files...")
     fpi_epochs_list = []
     fpi_flux_list = []
-    fpi_energies = None
+    fpi_energy_list = []
 
     for f in fpi_files:
         try:
@@ -242,18 +246,29 @@ def load_and_process_mms_data(fpi_files, mec_files, target_energies_keV,
                 f'mms{probe}_dis_energy_omni_fast',
                 'mms1_dis_energy_omni_fast'
             ] if v in zvars), None)
-            if en_var and fpi_energies is None:
-                raw_en = cdf.varget(en_var)
-                if raw_en is not None and np.size(raw_en) > 0:
-                    raw_en = np.asarray(raw_en, dtype=np.float64)
-                    fpi_energies = raw_en[0] if raw_en.ndim == 2 else raw_en
+            if not en_var:
+                continue
+            raw_en = cdf.varget(en_var)
+            if raw_en is None or np.size(raw_en) == 0:
+                continue
+            raw_en = np.asarray(raw_en, dtype=np.float64)
+            if raw_en.ndim == 1:
+                en_file = np.tile(raw_en, (len(u_sec), 1))
+            elif raw_en.ndim == 2:
+                if raw_en.shape[0] == len(u_sec):
+                    en_file = raw_en
+                else:
+                    en_file = np.tile(raw_en[0], (len(u_sec), 1))
+            else:
+                continue
 
-            if len(u_sec) != fl.shape[0]:
-                print(f"[Parser] Warning: Skipping {os.path.basename(f)} due to mismatch: epoch={len(u_sec)}, flux={fl.shape[0]}")
+            if len(u_sec) != fl.shape[0] or len(u_sec) != en_file.shape[0]:
+                print(f"[Parser] Warning: Skipping {os.path.basename(f)} due to mismatch: epoch={len(u_sec)}, flux={fl.shape[0]}, en={en_file.shape[0]}")
                 continue
 
             fpi_epochs_list.append(u_sec)
             fpi_flux_list.append(fl)
+            fpi_energy_list.append(en_file)
         except Exception as e:
             print(f"[Parser] Warning skipping {f}: {e}")
 
@@ -262,10 +277,12 @@ def load_and_process_mms_data(fpi_files, mec_files, target_energies_keV,
 
     fpi_epoch = np.concatenate(fpi_epochs_list)
     fpi_flux = np.concatenate(fpi_flux_list, axis=0)
+    fpi_energy = np.concatenate(fpi_energy_list, axis=0)
 
     s_idx = np.argsort(fpi_epoch)
     fpi_epoch = fpi_epoch[s_idx]
     fpi_flux = fpi_flux[s_idx]
+    fpi_energy = fpi_energy[s_idx]
 
     fpi_flux[fpi_flux <= 0] = np.nan
     fpi_flux[fpi_flux >= 1e25] = np.nan
@@ -389,6 +406,7 @@ def load_and_process_mms_data(fpi_files, mec_files, target_energies_keV,
 
         fpi_epoch = fpi_epoch[t_mask]
         fpi_flux = fpi_flux[t_mask]
+        fpi_energy = fpi_energy[t_mask]
         interp_x = interp_x[t_mask]
         interp_y = interp_y[t_mask]
         interp_z = interp_z[t_mask]
@@ -396,13 +414,13 @@ def load_and_process_mms_data(fpi_files, mec_files, target_energies_keV,
         interp_lt = interp_lt[t_mask]
 
     # Extract flux slices for all requested energy levels
-    print(f"[Parser] Extracting flux slices for {len(target_energies_keV)} energy channels...")
+    print(f"[Parser] Extracting flux slices for {len(target_energies_keV)} energy channels (handling dynamic energy tables)...")
     n_energies = len(target_energies_keV)
     flux_matrix = np.full((len(fpi_epoch), n_energies), np.nan, dtype=np.float64)
 
     for idx, e_kev in enumerate(target_energies_keV):
         target_eV = e_kev * 1000.0
-        flux_matrix[:, idx] = extract_flux_at_energy(fpi_energies, fpi_flux, target_eV)
+        flux_matrix[:, idx] = extract_flux_at_energy(fpi_energy, fpi_flux, target_eV)
 
     return {
         'time': fpi_epoch,
