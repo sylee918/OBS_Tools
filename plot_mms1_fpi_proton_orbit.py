@@ -564,6 +564,7 @@ def plot_mms1_fpi_and_orbit(data_dict,
                             requested_end_dt=None,
                             noon_loc='top',
                             point_size=None,
+                            alpha=1.0,
                             step=None,
                             max_orbit_points=None,
                             output_path='mms1_fpi_ion_orbit.png',
@@ -836,17 +837,8 @@ def plot_mms1_fpi_and_orbit(data_dict,
         else:
             pt_size = 0.6
 
-    if n_pts <= 3000:
-        pt_alpha = 0.85
-    elif n_pts <= 15000:
-        pt_alpha = 0.70
-    elif n_pts <= 30000:
-        pt_alpha = 0.55
-    else:
-        pt_alpha = 0.40
-
     sc = ax2.scatter(theta, r_orbit, c=flux_slice, cmap=cmap, norm=norm,
-                     s=pt_size, alpha=pt_alpha, edgecolors='none', zorder=3,
+                     s=pt_size, alpha=alpha, edgecolors='none', zorder=3,
                      rasterized=True,
                      label=f'Flux @ ~{target_energy_keV:.2f} keV')
 
@@ -947,6 +939,8 @@ def main():
                         help="Target ion energy for polar orbit slice in keV (default: 1.0 keV)")
     parser.add_argument('--point-size', type=float, default=None,
                         help="Scatter point size on polar orbit plot (e.g. 0.8, 1.2, 2.0). Default: adaptive thin size.")
+    parser.add_argument('--alpha', type=float, default=1.0,
+                        help="Scatter point opacity (alpha) on polar orbit plot (default: 1.0, fully opaque / no transparency).")
     parser.add_argument('--step', type=int, default=None,
                         help="Step/stride to downsample orbit points (e.g. --step 5 draws every 5th point). Default: auto-downsamples based on duration.")
     parser.add_argument('--max-orbit-points', type=int, default=None,
@@ -1002,6 +996,7 @@ def main():
         requested_end_dt=dt_end,
         noon_loc=args.noon,
         point_size=args.point_size,
+        alpha=args.alpha,
         step=args.step,
         max_orbit_points=args.max_orbit_points,
         output_path=args.output,

@@ -574,6 +574,7 @@ def plot_themis_esa_and_orbit(data_dict,
                               requested_end_dt=None,
                               noon_loc='top',
                               point_size=None,
+                              alpha=1.0,
                               interval_min=15.0,
                               step=None,
                               output_path='themis_esa_ion_orbit.png',
@@ -859,17 +860,8 @@ def plot_themis_esa_and_orbit(data_dict,
         else:
             pt_size = 0.6
 
-    if n_pts <= 3000:
-        pt_alpha = 0.85
-    elif n_pts <= 15000:
-        pt_alpha = 0.70
-    elif n_pts <= 30000:
-        pt_alpha = 0.55
-    else:
-        pt_alpha = 0.40
-
     sc = ax2.scatter(theta, r_orbit, c=flux_slice, cmap=cmap, norm=norm,
-                     s=pt_size, alpha=pt_alpha, edgecolors='none', zorder=3,
+                     s=pt_size, alpha=alpha, edgecolors='none', zorder=3,
                      rasterized=True,
                      label=f'Flux @ ~{target_energy_keV:.2f} keV')
 
@@ -983,6 +975,8 @@ def main():
                         help="Orientation of polar orbit plot: 'top' (Sun/Noon at top, default) or 'bottom'.")
     parser.add_argument('--point-size', type=float, default=None,
                         help="Custom scatter point size for the polar orbit plot curve (e.g., 0.8, 1.2, 2.0).")
+    parser.add_argument('--alpha', type=float, default=1.0,
+                        help="Custom scatter point opacity (alpha) on polar orbit plot (default: 1.0, fully opaque / no transparency).")
     parser.add_argument('--interval', '--cadence', dest='interval', type=float, default=15.0,
                         help="Time interval in minutes to sample polar orbit points (default: 15.0 min). Set 0 for all points without limitation.")
     parser.add_argument('--step', type=int, default=None,
@@ -1044,6 +1038,7 @@ def main():
         requested_end_dt=dt_end,
         noon_loc=args.noon,
         point_size=args.point_size,
+        alpha=args.alpha,
         interval_min=args.interval,
         step=args.step,
         output_path=out_name,
