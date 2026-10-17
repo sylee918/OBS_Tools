@@ -21,7 +21,7 @@ echo "=========================================================="
 # source activate <your_environment>
 
 ### Run parallel extraction with 36 CPU workers matching PBS select
-python3 save_mms1_fpi_proton_orbit_nc.py \
+python3 save_mms1_fpi_proton_orbit_nc_parallel.py \
     --date 2018-01-01 2018-12-31 \
     --coord gse \
     --workers 36 \
@@ -30,3 +30,4 @@ python3 save_mms1_fpi_proton_orbit_nc.py \
 echo "=========================================================="
 echo "Job finished at $(date)"
 echo "=========================================================="
+
