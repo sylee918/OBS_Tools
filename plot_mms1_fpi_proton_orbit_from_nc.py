@@ -305,10 +305,12 @@ def main():
     )
     parser.add_argument('--input', '-i', type=str, required=True,
                         help="Path to input NetCDF (.nc) file.")
-    parser.add_argument('--mode', type=str, default='grid', choices=['grid', 'single'],
-                        help="Plot mode: 'grid' (all energy channels side-by-side, default) or 'single' (one energy).")
-    parser.add_argument('--energy', type=float, default=1.821,
-                        help="Target energy in keV for single mode (default: 1.821 keV).")
+    parser.add_argument('--probe', type=str, default=None,
+                        help="MMS Probe number (optional, e.g. 1, 2, 3, 4).")
+    parser.add_argument('--mode', type=str, default=None, choices=['grid', 'single'],
+                        help="Plot mode: 'grid' (all energy channels side-by-side) or 'single' (one energy). Default: 'single' if --energy is given, else 'grid'.")
+    parser.add_argument('--energy', type=float, default=None,
+                        help="Target energy in keV for single mode (e.g. 0.439).")
     parser.add_argument('--noon', type=str, default='top', choices=['top', 'bottom'],
                         help="Orientation of Sun/Noon (12 LT): 'top' (default) or 'bottom'.")
     parser.add_argument('--point-size', type=float, default=None,
@@ -322,22 +324,35 @@ def main():
 
     args = parser.parse_args()
 
+    # Smart mode selection: if --energy is explicitly given, default to 'single'
+    if args.mode is not None:
+        mode = args.mode
+    elif args.energy is not None:
+        mode = 'single'
+    else:
+        mode = 'grid'
+
+    target_energy = args.energy if args.energy is not None else 1.821
+
     # Load NetCDF
     print(f"[Reader] Loading data from {args.input}...")
     data = read_mms_nc(args.input)
+    if args.probe is not None:
+        p_str = str(args.probe).strip().lower().replace('mms', '')
+        data['probe'] = f"MMS{p_str}"
     print(f"[Reader] Loaded {len(data['time'])} timestamps, {len(data['energy'])} energy channels: {data['energy']}")
 
     # Determine output name if not specified
     base_name = os.path.splitext(os.path.basename(args.input))[0]
     if args.output is None:
-        if args.mode == 'grid':
+        if mode == 'grid':
             out_file = f"{base_name}_grid.png"
         else:
-            out_file = f"{base_name}_{args.energy:.3f}keV.png"
+            out_file = f"{base_name}_{target_energy:.3f}keV.png"
     else:
         out_file = args.output
 
-    if args.mode == 'grid':
+    if mode == 'grid':
         plot_grid(
             data=data,
             noon_loc=args.noon,
@@ -349,7 +364,7 @@ def main():
     else:
         plot_single(
             data=data,
-            target_energy_keV=args.energy,
+            target_energy_keV=target_energy,
             noon_loc=args.noon,
             point_size=args.point_size,
             alpha=args.alpha,
