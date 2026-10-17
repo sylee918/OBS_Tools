@@ -214,8 +214,13 @@ def load_and_process_mms_data(fpi_files, mec_files, target_energies_keV,
         try:
             cdf = cdflib.CDF(f)
             zvars = set(cdf.cdf_info().zVariables)
-            ep_var = next((v for v in ['Epoch', 'epoch'] if v in zvars), None)
-            fl_var = next((v for v in [f'mms{probe}_dis_energyspectr_fast', 'mms1_dis_energyspectr_fast'] if v in zvars), None)
+            ep_var = next((v for v in ['Epoch', 'Epoch_plus_var', 'epoch'] if v in zvars), None)
+            fl_var = next((v for v in [
+                f'mms{probe}_dis_energyspectr_omni_fast',
+                'mms1_dis_energyspectr_omni_fast',
+                f'mms{probe}_dis_energyspectr_fast',
+                'mms1_dis_energyspectr_fast'
+            ] if v in zvars), None)
             if not ep_var or not fl_var:
                 continue
 
@@ -226,8 +231,17 @@ def load_and_process_mms_data(fpi_files, mec_files, target_energies_keV,
 
             u_sec = np.atleast_1d(cdflib.cdfepoch.unixtime(raw_ep))
             fl = np.asarray(raw_fl, dtype=np.float64)
+            if fl.ndim == 1:
+                fl = fl.reshape(1, -1)
+            elif fl.ndim == 0 or fl.size == 0:
+                continue
 
-            en_var = next((v for v in [f'mms{probe}_dis_energy_fast', 'mms1_dis_energy_fast'] if v in zvars), None)
+            en_var = next((v for v in [
+                f'mms{probe}_dis_energy_fast',
+                'mms1_dis_energy_fast',
+                f'mms{probe}_dis_energy_omni_fast',
+                'mms1_dis_energy_omni_fast'
+            ] if v in zvars), None)
             if en_var and fpi_energies is None:
                 raw_en = cdf.varget(en_var)
                 if raw_en is not None and np.size(raw_en) > 0:
@@ -235,6 +249,7 @@ def load_and_process_mms_data(fpi_files, mec_files, target_energies_keV,
                     fpi_energies = raw_en[0] if raw_en.ndim == 2 else raw_en
 
             if len(u_sec) != fl.shape[0]:
+                print(f"[Parser] Warning: Skipping {os.path.basename(f)} due to mismatch: epoch={len(u_sec)}, flux={fl.shape[0]}")
                 continue
 
             fpi_epochs_list.append(u_sec)
@@ -243,7 +258,7 @@ def load_and_process_mms_data(fpi_files, mec_files, target_energies_keV,
             print(f"[Parser] Warning skipping {f}: {e}")
 
     if not fpi_epochs_list:
-        raise ValueError("Could not extract valid FPI data.")
+        raise ValueError("Could not extract valid FPI data from provided CDF files.")
 
     fpi_epoch = np.concatenate(fpi_epochs_list)
     fpi_flux = np.concatenate(fpi_flux_list, axis=0)
