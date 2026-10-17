@@ -174,20 +174,115 @@ def find_local_mms_files(calendar_dates, probe='1', data_dir=None):
     return fpi_files, mec_files
 
 
+def _init_multiprocessing_worker():
+    """
+    Worker initializer for multiprocessing.Pool.
+    On HPC PBS / Slurm clusters (e.g. NAS Pleiades / Lou), child processes often inherit
+    a restrictive CPU affinity mask pinned to Core 0. This unpins each worker across
+    all allocated cores in the node/cpuset.
+    """
+    if hasattr(os, 'sched_getaffinity') and hasattr(os, 'sched_setaffinity'):
+        try:
+            total_cpus = os.cpu_count() or 36
+            for n in range(total_cpus, 0, -1):
+                try:
+                    os.sched_setaffinity(0, set(range(n)))
+                    break
+                except OSError:
+                    continue
+        except Exception:
+            pass
+
+
+def unbind_process_affinity(requested_workers=None):
+    """
+    Checks and unbinds CPU affinity mask in the parent process if it is pinned to a single core by PBS.
+    """
+    if hasattr(os, 'sched_getaffinity') and hasattr(os, 'sched_setaffinity'):
+        try:
+            curr = os.sched_getaffinity(0)
+            total = os.cpu_count() or 36
+            print(f"[Affinity] Initial CPU affinity mask: {len(curr)} core(s) out of {total} detected.")
+            if len(curr) < total:
+                for n in range(total, 0, -1):
+                    try:
+                        os.sched_setaffinity(0, set(range(n)))
+                        new_aff = os.sched_getaffinity(0)
+                        print(f"[Affinity] Expanded CPU affinity to {len(new_aff)} cores.")
+                        break
+                    except OSError:
+                        continue
+        except Exception as e:
+            print(f"[Affinity] Note: sched affinity check skipped: {e}")
+
+
 def extract_flux_at_energy(energy_eV, flux_2d, target_energy_eV):
     """
-    Log-log interpolation across energy channels for each time step.
+    Ultra-fast log-log interpolation across energy channels for each time step.
     Supports time-varying energy tables (e.g. Survey mode vs Solar Wind mode).
     energy_eV: shape (N, 32) or (32,)
     flux_2d: shape (N, 32)
+    target_energy_eV: scalar float
     """
     n_times = flux_2d.shape[0]
     flux_target = np.full(n_times, np.nan, dtype=np.float64)
     log_target_e = np.log10(target_energy_eV)
-    is_2d = (energy_eV.ndim == 2)
 
+    if energy_eV.ndim == 1:
+        valid_e = np.isfinite(energy_eV) & (energy_eV > 0)
+        if np.sum(valid_e) >= 2:
+            sub_e = energy_eV[valid_e]
+            s = np.argsort(sub_e)
+            sub_e_sorted = sub_e[s]
+            log_e = np.log10(sub_e_sorted)
+            idx = np.searchsorted(sub_e_sorted, target_energy_eV)
+            if 0 < idx < len(sub_e_sorted):
+                e0, e1 = log_e[idx-1], log_e[idx]
+                f0 = flux_2d[:, valid_e][:, s[idx-1]]
+                f1 = flux_2d[:, valid_e][:, s[idx]]
+                valid_f = np.isfinite(f0) & np.isfinite(f1) & (f0 > 0) & (f1 > 0)
+                t = (log_target_e - e0) / (e1 - e0)
+                flux_target[valid_f] = 10.0 ** ((1.0 - t) * np.log10(f0[valid_f]) + t * np.log10(f1[valid_f]))
+            elif idx == 0 and target_energy_eV == sub_e_sorted[0]:
+                flux_target = flux_2d[:, valid_e][:, s[0]]
+            elif idx == len(sub_e_sorted) and target_energy_eV == sub_e_sorted[-1]:
+                flux_target = flux_2d[:, valid_e][:, s[-1]]
+        return flux_target
+
+    # 2D energy table: Group by unique energy rows (typically 2-4 distinct tables across a full year)
+    e_round = np.round(energy_eV, decimals=2)
+    unique_e, inverse_indices = np.unique(e_round, axis=0, return_inverse=True)
+
+    if len(unique_e) < 50:
+        for u_i, u_grid in enumerate(unique_e):
+            mask = (inverse_indices == u_i)
+            valid_e = np.isfinite(u_grid) & (u_grid > 0)
+            if np.sum(valid_e) < 2:
+                continue
+            sub_e = u_grid[valid_e]
+            s = np.argsort(sub_e)
+            sub_e_sorted = sub_e[s]
+            log_e = np.log10(sub_e_sorted)
+            idx = np.searchsorted(sub_e_sorted, target_energy_eV)
+            if 0 < idx < len(sub_e_sorted):
+                e0, e1 = log_e[idx-1], log_e[idx]
+                f_sub = flux_2d[mask]
+                f0 = f_sub[:, valid_e][:, s[idx-1]]
+                f1 = f_sub[:, valid_e][:, s[idx]]
+                valid_f = np.isfinite(f0) & np.isfinite(f1) & (f0 > 0) & (f1 > 0)
+                t = (log_target_e - e0) / (e1 - e0)
+                res = np.full(np.sum(mask), np.nan, dtype=np.float64)
+                res[valid_f] = 10.0 ** ((1.0 - t) * np.log10(f0[valid_f]) + t * np.log10(f1[valid_f]))
+                flux_target[mask] = res
+            elif idx == 0 and target_energy_eV == sub_e_sorted[0]:
+                flux_target[mask] = flux_2d[mask][:, valid_e][:, s[0]]
+            elif idx == len(sub_e_sorted) and target_energy_eV == sub_e_sorted[-1]:
+                flux_target[mask] = flux_2d[mask][:, valid_e][:, s[-1]]
+        return flux_target
+
+    # Fallback to row-by-row if energy tables vary continuously
     for i in range(n_times):
-        e_row = energy_eV[i] if is_2d else energy_eV
+        e_row = energy_eV[i]
         f_row = flux_2d[i]
         valid = np.isfinite(e_row) & np.isfinite(f_row) & (f_row > 0) & (e_row > 0)
         if np.sum(valid) >= 2:
@@ -343,15 +438,18 @@ def load_and_process_mms_data(fpi_files, mec_files, target_energies_keV,
         workers = min(36, os.cpu_count() or 4)
     workers = max(1, int(workers))
 
+    # Unbind affinity in parent process so child processes can inherit full allocation
+    unbind_process_affinity(workers)
+
     fpi_epochs_list = []
     fpi_flux_list = []
     fpi_energy_list = []
 
-    print(f"[Parser] Reading {len(fpi_files)} FPI files with {workers} parallel worker(s)...")
+    print(f"[Parser] Reading {len(fpi_files)} FPI files with {workers} parallel worker(s)...", flush=True)
     if workers > 1 and len(fpi_files) > 1:
         fpi_tasks = [(f, probe) for f in fpi_files]
         chunksize = max(1, len(fpi_tasks) // (workers * 4))
-        with multiprocessing.Pool(processes=workers) as pool:
+        with multiprocessing.Pool(processes=workers, initializer=_init_multiprocessing_worker) as pool:
             results = pool.map(_parse_single_fpi_file, fpi_tasks, chunksize=chunksize)
         for res in results:
             if res is not None:
@@ -390,11 +488,11 @@ def load_and_process_mms_data(fpi_files, mec_files, target_energies_keV,
     mec_r_list = []
     mec_lt_list = []
 
-    print(f"[Parser] Reading {len(mec_files)} MEC files with {workers} parallel worker(s)...")
+    print(f"[Parser] Reading {len(mec_files)} MEC files with {workers} parallel worker(s)...", flush=True)
     if workers > 1 and len(mec_files) > 1:
         mec_tasks = [(f, probe, coord) for f in mec_files]
         chunksize = max(1, len(mec_tasks) // (workers * 4))
-        with multiprocessing.Pool(processes=workers) as pool:
+        with multiprocessing.Pool(processes=workers, initializer=_init_multiprocessing_worker) as pool:
             results = pool.map(_parse_single_mec_file, mec_tasks, chunksize=chunksize)
         for res in results:
             if res is not None:
