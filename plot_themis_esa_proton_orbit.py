@@ -573,8 +573,8 @@ def plot_themis_esa_and_orbit(data_dict,
                               requested_end_dt=None,
                               noon_loc='top',
                               point_size=None,
+                              interval_min=15.0,
                               step=None,
-                              max_orbit_points=None,
                               output_path='themis_esa_ion_orbit.png',
                               dpi=300):
     """
@@ -613,34 +613,54 @@ def plot_themis_esa_and_orbit(data_dict,
             date_title = f"{t_start_dt.strftime('%Y-%m-%d')} to {t_end_dt.strftime('%Y-%m-%d')}"
 
     # -------------------------------------------------------------------------
-    # Downsample Orbit Points for High-Performance Rendering (듬성듬성 그리기)
+    # Orbit Point Sampling (15-Minute Fixed Interval, No Point Count Limit)
     # -------------------------------------------------------------------------
-    n_total_pts = len(lt)
-    n_days = max(1.0, total_hours / 24.0)
-    if max_orbit_points is not None:
-        effective_max = max_orbit_points
-    else:
-        # Dynamically scale ~100 points/day (~100 pts/orbit), clamped between 3,000 and 45,000
-        effective_max = int(np.clip(n_days * 100, 3000, 45000))
-
     if step is not None and step > 1:
-        stride = int(step)
-    elif n_total_pts > effective_max:
-        stride = int(np.ceil(n_total_pts / effective_max))
-    else:
-        stride = 1
+        lt_orbit = lt[::step]
+        r_orbit = r_re[::step]
+        yaxis_orbit = yaxis_eV[::step]
+        flux_orbit = flux[::step]
+        print(f"[Plotting] Custom step stride applied ({len(lt)} -> {len(lt_orbit)} points)...")
+    elif interval_min is not None and interval_min > 0:
+        cadence_sec = interval_min * 60.0
+        t_epochs = data_dict.get('epochs', None)
+        if t_epochs is not None and len(t_epochs) > 0:
+            t_start_grid = np.floor(t_epochs[0] / cadence_sec) * cadence_sec
+            target_grid = np.arange(t_start_grid, t_epochs[-1] + cadence_sec, cadence_sec)
+            idx = np.searchsorted(t_epochs, target_grid)
+            idx = np.clip(idx, 0, len(t_epochs) - 1)
+            prev_idx = np.maximum(0, idx - 1)
+            dist_curr = np.abs(t_epochs[idx] - target_grid)
+            dist_prev = np.abs(t_epochs[prev_idx] - target_grid)
+            best_idx = np.where(dist_prev < dist_curr, prev_idx, idx)
 
-    if stride > 1:
-        print(f"[Plotting] Fast mode: Downsampling polar orbit points by factor {stride} ({n_total_pts} -> {len(lt[::stride])} points)...")
-        lt_orbit = lt[::stride]
-        r_orbit = r_re[::stride]
-        yaxis_orbit = yaxis_eV[::stride]
-        flux_orbit = flux[::stride]
+            valid = np.abs(t_epochs[best_idx] - target_grid) <= (cadence_sec / 2.0)
+            sample_idx = np.unique(best_idx[valid])
+            if len(sample_idx) > 0:
+                lt_orbit = lt[sample_idx]
+                r_orbit = r_re[sample_idx]
+                yaxis_orbit = yaxis_eV[sample_idx]
+                flux_orbit = flux[sample_idx]
+                print(f"[Plotting] Sampled polar orbit points at {interval_min:g}-minute intervals ({len(lt)} -> {len(lt_orbit)} points, point limit removed)...")
+            else:
+                lt_orbit, r_orbit, yaxis_orbit, flux_orbit = lt, r_re, yaxis_eV, flux
+        else:
+            cadence_num = interval_min / (24.0 * 60.0)
+            target_times = np.arange(times_num[0], times_num[-1] + cadence_num, cadence_num)
+            idx = np.clip(np.searchsorted(times_num, target_times), 0, len(times_num) - 1)
+            sample_idx = np.unique(idx)
+            lt_orbit = lt[sample_idx]
+            r_orbit = r_re[sample_idx]
+            yaxis_orbit = yaxis_eV[sample_idx]
+            flux_orbit = flux[sample_idx]
+            print(f"[Plotting] Sampled polar orbit points at {interval_min:g}-minute intervals ({len(lt)} -> {len(lt_orbit)} points, point limit removed)...")
     else:
+        # Full points without limitation or downsampling
         lt_orbit = lt
         r_orbit = r_re
         yaxis_orbit = yaxis_eV
         flux_orbit = flux
+        print(f"[Plotting] Orbit points: Rendering all {len(lt)} points without limitation...")
 
     print(f"[Plotting] Extracting ion flux slice at ~{target_energy_keV:.2f} keV ({len(lt_orbit)} points)...")
     flux_slice = extract_flux_at_energy(yaxis_orbit, flux_orbit, target_energy_eV)
@@ -962,10 +982,10 @@ def main():
                         help="Orientation of polar orbit plot: 'top' (Sun/Noon at top, default) or 'bottom'.")
     parser.add_argument('--point-size', type=float, default=None,
                         help="Custom scatter point size for the polar orbit plot curve (e.g., 0.8, 1.2, 2.0).")
+    parser.add_argument('--interval', '--cadence', dest='interval', type=float, default=15.0,
+                        help="Time interval in minutes to sample polar orbit points (default: 15.0 min). Set 0 for all points without limitation.")
     parser.add_argument('--step', type=int, default=None,
-                        help="Step/stride to downsample orbit points (e.g. --step 5 draws every 5th point). Default: auto-downsamples based on duration.")
-    parser.add_argument('--max-orbit-points', type=int, default=None,
-                        help="Maximum points to render on polar orbit plot (default: dynamic ~100 pts/day, 3000-45000).")
+                        help="Optional manual step/stride to downsample orbit points (e.g. --step 5 draws every 5th point).")
     parser.add_argument('--download', action='store_true',
                         help="Auto-download missing CDF files if not cached locally.")
     parser.add_argument('--data-dir', type=str, default=None,
@@ -986,14 +1006,14 @@ def main():
     else:
         out_name = args.output
 
-    pts_str = f"{args.max_orbit_points}" if args.max_orbit_points is not None else "Dynamic (~100 pts/day, 3k-45k)"
+    interval_str = f"{args.interval:g} min (no point limit)" if (args.interval and args.interval > 0) else "None (Full points)"
     print("=" * 78)
     print(f"THEMIS-{probe.upper()} ESA Ion Spectrogram & Polar Orbit Trajectory Analysis")
     print(f"Time Range : {dt_start.strftime('%Y-%m-%d %H:%M:%S')} to {dt_end.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Calendar Days : {len(calendar_dates)} day(s) -> {calendar_dates[0]} to {calendar_dates[-1]}")
     print(f"Coordinates: {args.coord.upper()} | Energy Slice: {args.energy:.2f} keV | ESA Mode: {args.mode}")
     print(f"Noon Axis  : {args.noon.capitalize()} | Output: {out_name}")
-    print(f"Fast Render: Orbit Points Max={pts_str} | Step={args.step if args.step else 'Auto'}")
+    print(f"Orbit Cadence: {interval_str} | Step={args.step if args.step else 'None'}")
     print("=" * 78)
 
     # 1. Rapidly discover local CDF files (or download if explicitly enabled)
@@ -1023,8 +1043,8 @@ def main():
         requested_end_dt=dt_end,
         noon_loc=args.noon,
         point_size=args.point_size,
+        interval_min=args.interval,
         step=args.step,
-        max_orbit_points=args.max_orbit_points,
         output_path=out_name,
         dpi=args.dpi
     )
@@ -1036,5 +1056,4 @@ def main():
 
 if __name__ == '__main__':
     main()
-
 
