@@ -25,6 +25,7 @@ import os
 import re
 import argparse
 import datetime
+import multiprocessing
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -198,79 +199,172 @@ def extract_flux_at_energy(energy_eV, flux_2d, target_energy_eV):
     return flux_target
 
 
-def load_and_process_mms_data(fpi_files, mec_files, target_energies_keV,
-                              probe='1', coord='gse', clip_start_dt=None, clip_end_dt=None):
+def _parse_single_fpi_file(args):
     """
-    Loads FPI spectra and MEC ephemeris, interpolates coordinates onto FPI timestamps,
-    and extracts flux slices across all target_energies_keV.
+    Worker function to parse a single FPI CDF file in parallel.
+    """
+    f, probe = args
+    try:
+        cdf = cdflib.CDF(f)
+        zvars = set(cdf.cdf_info().zVariables)
+        ep_var = next((v for v in ['Epoch', 'Epoch_plus_var', 'epoch'] if v in zvars), None)
+        fl_var = next((v for v in [
+            f'mms{probe}_dis_energyspectr_omni_fast',
+            'mms1_dis_energyspectr_omni_fast',
+            f'mms{probe}_dis_energyspectr_fast',
+            'mms1_dis_energyspectr_fast'
+        ] if v in zvars), None)
+        if not ep_var or not fl_var:
+            return None
+
+        raw_ep = cdf.varget(ep_var)
+        raw_fl = cdf.varget(fl_var)
+        if raw_ep is None or raw_fl is None or np.size(raw_ep) == 0:
+            return None
+
+        u_sec = np.atleast_1d(cdflib.cdfepoch.unixtime(raw_ep))
+        fl = np.asarray(raw_fl, dtype=np.float64)
+        if fl.ndim == 1:
+            fl = fl.reshape(1, -1)
+        elif fl.ndim == 0 or fl.size == 0:
+            return None
+
+        en_var = next((v for v in [
+            f'mms{probe}_dis_energy_fast',
+            'mms1_dis_energy_fast',
+            f'mms{probe}_dis_energy_omni_fast',
+            'mms1_dis_energy_omni_fast'
+        ] if v in zvars), None)
+        if not en_var:
+            return None
+        raw_en = cdf.varget(en_var)
+        if raw_en is None or np.size(raw_en) == 0:
+            return None
+        raw_en = np.asarray(raw_en, dtype=np.float64)
+        if raw_en.ndim == 1:
+            en_file = np.tile(raw_en, (len(u_sec), 1))
+        elif raw_en.ndim == 2:
+            if raw_en.shape[0] == len(u_sec):
+                en_file = raw_en
+            else:
+                en_file = np.tile(raw_en[0], (len(u_sec), 1))
+        else:
+            return None
+
+        if len(u_sec) != fl.shape[0] or len(u_sec) != en_file.shape[0]:
+            return None
+
+        return (u_sec, fl, en_file)
+    except Exception:
+        return None
+
+
+def _parse_single_mec_file(args):
+    """
+    Worker function to parse a single MEC CDF file in parallel.
+    """
+    f, probe, coord = args
+    try:
+        cdf = cdflib.CDF(f)
+        zvars = set(cdf.cdf_info().zVariables)
+        ep_var = next((v for v in ['Epoch', 'epoch'] if v in zvars), None)
+        if not ep_var:
+            return None
+        raw_ep = cdf.varget(ep_var)
+        if raw_ep is None or np.size(raw_ep) == 0:
+            return None
+
+        u_sec = np.atleast_1d(cdflib.cdfepoch.unixtime(raw_ep))
+        if coord == 'gse':
+            r_var = next((v for v in [f'mms{probe}_mec_r_gse', 'mms1_mec_r_gse',
+                                      f'mms{probe}_mec_r_gsm', 'mms1_mec_r_gsm'] if v in zvars), None)
+        else:
+            r_var = next((v for v in [f'mms{probe}_mec_r_gsm', 'mms1_mec_r_gsm',
+                                      f'mms{probe}_mec_r_gse', 'mms1_mec_r_gse'] if v in zvars), None)
+        if not r_var:
+            return None
+
+        r_raw = cdf.varget(r_var)
+        if r_raw is None or np.size(r_raw) == 0:
+            return None
+        r_vec = np.asarray(r_raw, dtype=np.float64)
+        if r_vec.ndim == 1:
+            r_vec = r_vec.reshape(1, -1)
+        if r_vec.shape[1] != 3:
+            return None
+
+        bad_r = np.abs(r_vec[:, 0]) > 1e10
+        r_vec[bad_r] = np.nan
+
+        # Earth radius normalization (6371.2 km)
+        x_re = r_vec[:, 0] / 6371.2
+        y_re = r_vec[:, 1] / 6371.2
+        z_re = r_vec[:, 2] / 6371.2
+        r_re = np.linalg.norm(r_vec, axis=1) / 6371.2
+
+        if coord == 'gse':
+            phi = np.arctan2(r_vec[:, 1], r_vec[:, 0])
+            lt_val = (phi * 12.0 / np.pi + 12.0) % 24.0
+        else:
+            mlt_var = next((v for v in [f'mms{probe}_mec_mlt', 'mms1_mec_mlt'] if v in zvars), None)
+            if mlt_var:
+                raw_mlt = cdf.varget(mlt_var)
+                if raw_mlt is not None and np.size(raw_mlt) > 0:
+                    lt_val = np.asarray(raw_mlt, dtype=np.float64)
+                    lt_val[(lt_val < 0) | (lt_val > 24)] = np.nan
+                else:
+                    phi = np.arctan2(r_vec[:, 1], r_vec[:, 0])
+                    lt_val = (phi * 12.0 / np.pi + 12.0) % 24.0
+            else:
+                phi = np.arctan2(r_vec[:, 1], r_vec[:, 0])
+                lt_val = (phi * 12.0 / np.pi + 12.0) % 24.0
+
+        if len(u_sec) != len(r_re) or len(u_sec) != len(lt_val):
+            return None
+
+        return (u_sec, x_re, y_re, z_re, r_re, lt_val)
+    except Exception:
+        return None
+
+
+def load_and_process_mms_data(fpi_files, mec_files, target_energies_keV,
+                              probe='1', coord='gse', clip_start_dt=None, clip_end_dt=None,
+                              workers=None):
+    """
+    Loads FPI spectra and MEC ephemeris using parallel worker processes,
+    interpolates coordinates onto FPI timestamps, and extracts flux slices.
     """
     if not fpi_files:
         raise FileNotFoundError(f"No MMS{probe} FPI files available.")
     if not mec_files:
         raise FileNotFoundError(f"No MMS{probe} MEC files available.")
 
-    print(f"[Parser] Reading {len(fpi_files)} FPI files...")
+    if workers is None:
+        workers = min(36, os.cpu_count() or 4)
+    workers = max(1, int(workers))
+
     fpi_epochs_list = []
     fpi_flux_list = []
     fpi_energy_list = []
 
-    for f in fpi_files:
-        try:
-            cdf = cdflib.CDF(f)
-            zvars = set(cdf.cdf_info().zVariables)
-            ep_var = next((v for v in ['Epoch', 'Epoch_plus_var', 'epoch'] if v in zvars), None)
-            fl_var = next((v for v in [
-                f'mms{probe}_dis_energyspectr_omni_fast',
-                'mms1_dis_energyspectr_omni_fast',
-                f'mms{probe}_dis_energyspectr_fast',
-                'mms1_dis_energyspectr_fast'
-            ] if v in zvars), None)
-            if not ep_var or not fl_var:
-                continue
-
-            raw_ep = cdf.varget(ep_var)
-            raw_fl = cdf.varget(fl_var)
-            if raw_ep is None or raw_fl is None or np.size(raw_ep) == 0:
-                continue
-
-            u_sec = np.atleast_1d(cdflib.cdfepoch.unixtime(raw_ep))
-            fl = np.asarray(raw_fl, dtype=np.float64)
-            if fl.ndim == 1:
-                fl = fl.reshape(1, -1)
-            elif fl.ndim == 0 or fl.size == 0:
-                continue
-
-            en_var = next((v for v in [
-                f'mms{probe}_dis_energy_fast',
-                'mms1_dis_energy_fast',
-                f'mms{probe}_dis_energy_omni_fast',
-                'mms1_dis_energy_omni_fast'
-            ] if v in zvars), None)
-            if not en_var:
-                continue
-            raw_en = cdf.varget(en_var)
-            if raw_en is None or np.size(raw_en) == 0:
-                continue
-            raw_en = np.asarray(raw_en, dtype=np.float64)
-            if raw_en.ndim == 1:
-                en_file = np.tile(raw_en, (len(u_sec), 1))
-            elif raw_en.ndim == 2:
-                if raw_en.shape[0] == len(u_sec):
-                    en_file = raw_en
-                else:
-                    en_file = np.tile(raw_en[0], (len(u_sec), 1))
-            else:
-                continue
-
-            if len(u_sec) != fl.shape[0] or len(u_sec) != en_file.shape[0]:
-                print(f"[Parser] Warning: Skipping {os.path.basename(f)} due to mismatch: epoch={len(u_sec)}, flux={fl.shape[0]}, en={en_file.shape[0]}")
-                continue
-
-            fpi_epochs_list.append(u_sec)
-            fpi_flux_list.append(fl)
-            fpi_energy_list.append(en_file)
-        except Exception as e:
-            print(f"[Parser] Warning skipping {f}: {e}")
+    print(f"[Parser] Reading {len(fpi_files)} FPI files with {workers} parallel worker(s)...")
+    if workers > 1 and len(fpi_files) > 1:
+        fpi_tasks = [(f, probe) for f in fpi_files]
+        chunksize = max(1, len(fpi_tasks) // (workers * 4))
+        with multiprocessing.Pool(processes=workers) as pool:
+            results = pool.map(_parse_single_fpi_file, fpi_tasks, chunksize=chunksize)
+        for res in results:
+            if res is not None:
+                fpi_epochs_list.append(res[0])
+                fpi_flux_list.append(res[1])
+                fpi_energy_list.append(res[2])
+    else:
+        for f in fpi_files:
+            res = _parse_single_fpi_file((f, probe))
+            if res is not None:
+                fpi_epochs_list.append(res[0])
+                fpi_flux_list.append(res[1])
+                fpi_energy_list.append(res[2])
 
     if not fpi_epochs_list:
         raise ValueError("Could not extract valid FPI data from provided CDF files.")
@@ -296,71 +390,33 @@ def load_and_process_mms_data(fpi_files, mec_files, target_energies_keV,
     mec_r_list = []
     mec_lt_list = []
 
-    print(f"[Parser] Reading {len(mec_files)} MEC files (coord: {coord.upper()})...")
-    for f in mec_files:
-        try:
-            cdf = cdflib.CDF(f)
-            zvars = set(cdf.cdf_info().zVariables)
-            ep_var = next((v for v in ['Epoch', 'epoch'] if v in zvars), None)
-            if not ep_var:
-                continue
-            raw_ep = cdf.varget(ep_var)
-            if raw_ep is None or np.size(raw_ep) == 0:
-                continue
+    print(f"[Parser] Reading {len(mec_files)} MEC files with {workers} parallel worker(s)...")
+    if workers > 1 and len(mec_files) > 1:
+        mec_tasks = [(f, probe, coord) for f in mec_files]
+        chunksize = max(1, len(mec_tasks) // (workers * 4))
+        with multiprocessing.Pool(processes=workers) as pool:
+            results = pool.map(_parse_single_mec_file, mec_tasks, chunksize=chunksize)
+        for res in results:
+            if res is not None:
+                mec_epochs_list.append(res[0])
+                mec_x_list.append(res[1])
+                mec_y_list.append(res[2])
+                mec_z_list.append(res[3])
+                mec_r_list.append(res[4])
+                mec_lt_list.append(res[5])
+    else:
+        for f in mec_files:
+            res = _parse_single_mec_file((f, probe, coord))
+            if res is not None:
+                mec_epochs_list.append(res[0])
+                mec_x_list.append(res[1])
+                mec_y_list.append(res[2])
+                mec_z_list.append(res[3])
+                mec_r_list.append(res[4])
+                mec_lt_list.append(res[5])
 
-            u_sec = np.atleast_1d(cdflib.cdfepoch.unixtime(raw_ep))
-            if coord == 'gse':
-                r_var = next((v for v in [f'mms{probe}_mec_r_gse', 'mms1_mec_r_gse',
-                                          f'mms{probe}_mec_r_gsm', 'mms1_mec_r_gsm'] if v in zvars), None)
-            else:
-                r_var = next((v for v in [f'mms{probe}_mec_r_gsm', 'mms1_mec_r_gsm',
-                                          f'mms{probe}_mec_r_gse', 'mms1_mec_r_gse'] if v in zvars), None)
-            if not r_var:
-                continue
-
-            r_raw = cdf.varget(r_var)
-            if r_raw is None or np.size(r_raw) == 0:
-                continue
-            r_vec = np.asarray(r_raw, dtype=np.float64)
-            if r_vec.ndim == 1:
-                r_vec = r_vec.reshape(1, -1)
-            if r_vec.shape[1] != 3:
-                continue
-
-            bad_r = np.abs(r_vec[:, 0]) > 1e10
-            r_vec[bad_r] = np.nan
-
-            # Earth radius normalization (6371.2 km)
-            x_re = r_vec[:, 0] / 6371.2
-            y_re = r_vec[:, 1] / 6371.2
-            z_re = r_vec[:, 2] / 6371.2
-            r_re = np.linalg.norm(r_vec, axis=1) / 6371.2
-
-            if coord == 'gse':
-                phi = np.arctan2(r_vec[:, 1], r_vec[:, 0])
-                lt_val = (phi * 12.0 / np.pi + 12.0) % 24.0
-            else:
-                mlt_var = next((v for v in [f'mms{probe}_mec_mlt', 'mms1_mec_mlt'] if v in zvars), None)
-                if mlt_var:
-                    raw_mlt = cdf.varget(mlt_var)
-                    if raw_mlt is not None and np.size(raw_mlt) > 0:
-                        lt_val = np.asarray(raw_mlt, dtype=np.float64)
-                        lt_val[(lt_val < 0) | (lt_val > 24)] = np.nan
-                    else:
-                        phi = np.arctan2(r_vec[:, 1], r_vec[:, 0])
-                        lt_val = (phi * 12.0 / np.pi + 12.0) % 24.0
-                else:
-                    phi = np.arctan2(r_vec[:, 1], r_vec[:, 0])
-                    lt_val = (phi * 12.0 / np.pi + 12.0) % 24.0
-
-            mec_epochs_list.append(u_sec)
-            mec_x_list.append(x_re)
-            mec_y_list.append(y_re)
-            mec_z_list.append(z_re)
-            mec_r_list.append(r_re)
-            mec_lt_list.append(lt_val)
-        except Exception as e:
-            print(f"[Parser] Warning skipping {f}: {e}")
+    if not mec_epochs_list:
+        raise ValueError("Could not extract valid MEC data from provided CDF files.")
 
     all_mec_epoch = np.concatenate(mec_epochs_list)
     all_mec_x = np.concatenate(mec_x_list)
@@ -576,6 +632,8 @@ def main():
                         help="Custom list of energy levels in keV.")
     parser.add_argument('--data-dir', type=str, default=None,
                         help="Custom local directory path for CDF files.")
+    parser.add_argument('--workers', '--ncpus', dest='workers', type=int, default=None,
+                        help="Number of parallel worker processes for CDF reading (default: min(36, cpu_count)).")
     parser.add_argument('--output', type=str, default=None,
                         help="Output .nc file path (default: mms{probe}_fpi_orbit_{date}.nc).")
 
@@ -595,6 +653,7 @@ def main():
     print(f" Time Range : {dt_start.strftime('%Y-%m-%d %H:%M:%S')} to {dt_end.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f" Coordinate : {args.coord.upper()}")
     print(f" Energies   : {len(args.energies)} channels: {args.energies}")
+    print(f" Workers    : {args.workers if args.workers else 'Auto (up to 36 CPUs)'}")
     print(f" Output .nc : {out_name}")
     print("=" * 76)
 
@@ -609,7 +668,8 @@ def main():
         probe=probe,
         coord=args.coord.lower(),
         clip_start_dt=dt_start,
-        clip_end_dt=dt_end
+        clip_end_dt=dt_end,
+        workers=args.workers
     )
 
     # 3. Save to NetCDF

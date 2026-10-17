@@ -1,0 +1,32 @@
+#PBS -S /bin/bash
+#PBS -N mms1_fpi_nc
+#PBS -l select=1:ncpus=36:mem=750GB
+#PBS -l walltime=02:00:00
+#PBS -q ldan
+#PBS -j oe
+#PBS -o mms1_nc_extract.log
+#PBS -m abe
+
+### Move to submission directory
+cd $PBS_O_WORKDIR
+
+echo "=========================================================="
+echo "Job started on $(hostname) at $(date)"
+echo "Working directory: $PBS_O_WORKDIR"
+echo "=========================================================="
+
+### Load environment / modules if required on Lou / Pleiades
+### (Uncomment or modify according to your environment)
+# module load python3
+# source activate <your_environment>
+
+### Run parallel extraction with 36 CPU workers matching PBS select
+python3 save_mms1_fpi_proton_orbit_nc.py \
+    --date 2018-01-01 2018-12-31 \
+    --coord gse \
+    --workers 36 \
+    --output mms1_orbit_flux_2018.nc
+
+echo "=========================================================="
+echo "Job finished at $(date)"
+echo "=========================================================="
