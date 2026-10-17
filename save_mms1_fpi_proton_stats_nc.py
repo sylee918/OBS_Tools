@@ -1,0 +1,610 @@
+#!/usr/bin/env python3
+"""
+save_mms1_fpi_proton_stats_nc.py
+================================
+Reads a 1-year (or multi-day) MMS FPI orbit & ion flux NetCDF (.nc) file
+(e.g., mms1_fpi_orbit_20250101_20251231.nc) and computes 2D spatial statistics
+binned by radial distance (default: dr = 0.5 R_E) and longitude / Local Time
+(default: dlon = 10 degrees).
+
+Saves a publication-ready statistical NetCDF (.nc) file containing:
+  1. Grid Coordinates & Bin Geometry:
+     - r_center, r_edge_low, r_edge_high, r_edges [R_E]
+     - lon_center, lon_edge_low, lon_edge_high, lon_edges [deg, 0 deg = 00 LT Midnight, 180 deg = 12 LT Noon]
+     - gse_lon_center [deg, 0 deg = +X Noon/Sun, 90 deg = +Y Dusk, 180 deg = -X Tail, 270 deg = -Y Dawn]
+     - lt_center, lt_edges [hours, 0 to 24 LT/MLT]
+     - bin_area_re2 [R_E^2, equatorial sector area of each (r, lon) cell]
+     - energy [keV, 12 energy channels]
+
+  2. Spacecraft Orbit & Sampling Statistics (2D: r x lon):
+     - orbit_sample_count : Total number of FPI time records in each (r, lon) bin
+     - dwell_time_sec     : Total spacecraft residence / dwell time [seconds]
+     - dwell_time_hours   : Total spacecraft residence / dwell time [hours]
+     - mean_z_re, std_z_re: Mean and standard deviation of spacecraft Z coordinate [R_E]
+
+  3. Ion Flux & Count Rate Statistics for Publication (3D: r x lon x energy):
+     - flux_mean          : Arithmetic mean of Differential Energy Flux (DEF) [keV/(cm^2 s sr keV)]
+     - flux_std           : Sample standard deviation (ddof=1) of DEF [keV/(cm^2 s sr keV)]
+     - flux_sem           : Standard Error of the Mean (SEM = std / sqrt(N_valid))
+     - flux_median        : Median (50th percentile) of DEF
+     - flux_q25, flux_q75 : 25th and 75th percentiles of DEF
+     - flux_iqr           : Interquartile range (Q75 - Q25) of DEF
+     - flux_p10, flux_p90 : 10th and 90th percentiles of DEF
+     - flux_min, flux_max : Minimum and maximum observed DEF in each bin
+     - flux_geom_mean     : Geometric mean of DEF (10^mean(log10(DEF)))
+     - flux_log10_mean    : Mean of log10(DEF)
+     - flux_log10_std     : Standard deviation of log10(DEF)
+     - flux_cv            : Coefficient of Variation (flux_std / flux_mean)
+     - valid_count        : Number of valid positive flux samples (N_valid)
+     - count_rate         : Valid measurement count rate (N_valid / dwell_time_sec) [counts / s]
+     - detection_ratio    : Valid detection fraction (N_valid / orbit_sample_count) [0 to 1]
+     - number_flux_mean   : Mean Differential Number Flux (J_N = DEF / E) [1/(cm^2 s sr keV)]
+     - number_flux_std    : Standard deviation of Differential Number Flux [1/(cm^2 s sr keV)]
+
+Usage Examples:
+  python3 save_mms1_fpi_proton_stats_nc.py --input mms1_fpi_orbit_20250101_20251231.nc
+  python3 save_mms1_fpi_proton_stats_nc.py --input mms1_fpi_orbit_20250101_20251231.nc --dr 0.5 --dlon 10 --output mms1_fpi_stats_2025.nc
+
+Author: Space Physics Pair-Programming Assistant
+"""
+
+import os
+import argparse
+import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+import numpy as np
+
+# Support both netCDF4 and scipy.io.netcdf fallback
+try:
+    import netCDF4 as nc
+    HAS_NETCDF4 = True
+except ImportError:
+    HAS_NETCDF4 = False
+    from scipy.io import netcdf_file
+
+
+def read_input_orbit_nc(nc_path):
+    """
+    Loads 1D time, spacecraft coordinates (x, y, z, r, lt), energy channels,
+    and 2D flux array (time, energy) from the input NetCDF file.
+    """
+    if not os.path.exists(nc_path):
+        raise FileNotFoundError(f"Input NetCDF file not found: {nc_path}")
+
+    data = {}
+    if HAS_NETCDF4:
+        with nc.Dataset(nc_path, 'r') as ds:
+            data['time'] = np.array(ds.variables['time'][:], dtype=np.float64)
+            data['x'] = np.array(ds.variables['x'][:], dtype=np.float64)
+            data['y'] = np.array(ds.variables['y'][:], dtype=np.float64)
+            data['z'] = np.array(ds.variables['z'][:], dtype=np.float64)
+            data['r'] = np.array(ds.variables['r'][:], dtype=np.float64)
+            data['lt'] = np.array(ds.variables['lt'][:], dtype=np.float64)
+            data['energy'] = np.array(ds.variables['energy'][:], dtype=np.float64)
+            data['flux'] = np.array(ds.variables['flux'][:], dtype=np.float64)
+            data['coord'] = str(getattr(ds, 'coordinate_system', 'GSE'))
+            data['probe'] = str(getattr(ds, 'spacecraft', 'MMS1'))
+    else:
+        with netcdf_file(nc_path, 'r', mmap=False) as ds:
+            data['time'] = np.array(ds.variables['time'][:], dtype=np.float64)
+            data['x'] = np.array(ds.variables['x'][:], dtype=np.float64)
+            data['y'] = np.array(ds.variables['y'][:], dtype=np.float64)
+            data['z'] = np.array(ds.variables['z'][:], dtype=np.float64)
+            data['r'] = np.array(ds.variables['r'][:], dtype=np.float64)
+            data['lt'] = np.array(ds.variables['lt'][:], dtype=np.float64)
+            data['energy'] = np.array(ds.variables['energy'][:], dtype=np.float64)
+            data['flux'] = np.array(ds.variables['flux'][:], dtype=np.float64)
+            coord_attr = getattr(ds, 'coordinate_system', b'GSE')
+            probe_attr = getattr(ds, 'spacecraft', b'MMS1')
+            data['coord'] = coord_attr.decode('utf-8') if isinstance(coord_attr, bytes) else str(coord_attr)
+            data['probe'] = probe_attr.decode('utf-8') if isinstance(probe_attr, bytes) else str(probe_attr)
+
+    return data
+
+
+def estimate_sample_dt(time_sec, default_dt=4.5, max_gap_sec=30.0):
+    """
+    Estimates the sampling interval dt (in seconds) represented by each record
+    to accurately compute spacecraft dwell time in each spatial bin.
+    For MMS FPI Fast Survey mode, nominal cadence is ~4.5 seconds.
+    """
+    n = len(time_sec)
+    if n == 0:
+        return np.array([], dtype=np.float64)
+    if n == 1:
+        return np.array([default_dt], dtype=np.float64)
+
+    diffs = np.diff(time_sec)
+    valid_diffs = diffs[(diffs > 0) & (diffs <= max_gap_sec)]
+    nominal_dt = float(np.median(valid_diffs)) if len(valid_diffs) > 0 else default_dt
+
+    dt = np.empty(n, dtype=np.float64)
+    dt[:-1] = diffs
+    dt[-1] = nominal_dt
+
+    # Replace non-positive or large orbit gaps with nominal cadence
+    bad_dt = (~np.isfinite(dt)) | (dt <= 0) | (dt > max_gap_sec)
+    dt[bad_dt] = nominal_dt
+    return dt
+
+
+def compute_2d_spatial_statistics(data, dr=0.5, dlon=10.0, r_min=0.0, r_max=None, min_samples=1):
+    """
+    Bins the spacecraft trajectory and multi-energy ion flux into (r, lon) grid cells
+    and calculates comprehensive statistics required for scientific publications.
+    """
+    time_sec = data['time']
+    x = data['x']
+    y = data['y']
+    z = data['z']
+    r = data['r']
+    lt = data['lt']
+    energies = data['energy']
+    flux = data['flux']
+
+    n_times = len(time_sec)
+    n_energies = len(energies)
+
+    # Determine radial upper bound if not explicitly set
+    if r_max is None:
+        max_obs_r = float(np.nanmax(r)) if np.any(np.isfinite(r)) else 15.0
+        r_max = float(np.ceil(max_obs_r / dr) * dr)
+        if r_max < max_obs_r + 1e-6:
+            r_max += dr
+
+    # Construct 1D bin edges and centers
+    n_r = int(np.round((r_max - r_min) / dr))
+    r_edges = np.linspace(r_min, r_min + n_r * dr, n_r + 1, dtype=np.float64)
+    r_edge_low = r_edges[:-1]
+    r_edge_high = r_edges[1:]
+    r_center = 0.5 * (r_edge_low + r_edge_high)
+
+    n_lon = int(np.round(360.0 / dlon))
+    lon_edges = np.linspace(0.0, 360.0, n_lon + 1, dtype=np.float64)
+    lon_edge_low = lon_edges[:-1]
+    lon_edge_high = lon_edges[1:]
+    lon_center = 0.5 * (lon_edge_low + lon_edge_high)
+
+    # Local Time [hours, 0 to 24] corresponding to lon_deg (0 deg = 00 LT, 180 deg = 12 LT)
+    lt_edges = lon_edges / 15.0
+    lt_center = lon_center / 15.0
+
+    # Standard GSE/GSM azimuth [deg] where 0 deg = +X (Noon/Sun), 90 deg = +Y (Dusk)
+    gse_lon_center = (lon_center - 180.0) % 360.0
+
+    # Equatorial cell area [R_E^2]: dA = 0.5 * (r_high^2 - r_low^2) * dtheta_rad
+    dtheta_rad = np.deg2rad(dlon)
+    r_area_1d = 0.5 * (r_edge_high ** 2 - r_edge_low ** 2) * dtheta_rad
+    bin_area_re2 = np.repeat(r_area_1d[:, np.newaxis], n_lon, axis=1)
+
+    # Convert each timestamp's LT [0, 24) to azimuthal longitude [0, 360) deg
+    lon_pts = (lt * 15.0) % 360.0
+
+    # Estimate per-record sampling duration dt [sec]
+    dt_sec = estimate_sample_dt(time_sec)
+
+    # Filter timestamps with valid radial and angular coordinates inside grid range
+    valid_pos = (
+        np.isfinite(r) & np.isfinite(lon_pts) &
+        (r >= r_min) & (r < r_edges[-1])
+    )
+
+    ir_all = np.floor((r[valid_pos] - r_min) / dr).astype(np.int64)
+    ilon_all = np.floor(lon_pts[valid_pos] / dlon).astype(np.int64)
+
+    ir_all = np.clip(ir_all, 0, n_r - 1)
+    ilon_all = np.clip(ilon_all, 0, n_lon - 1)
+
+    flat_idx = ir_all * n_lon + ilon_all
+
+    # Subset valid position records
+    z_sub = z[valid_pos]
+    dt_sub = dt_sec[valid_pos]
+    flux_sub = flux[valid_pos, :]
+
+    # Sort by flat cell index for fast contiguous-slice aggregation
+    sort_order = np.argsort(flat_idx, kind='mergesort')
+    flat_sorted = flat_idx[sort_order]
+    z_sorted = z_sub[sort_order]
+    dt_sorted = dt_sub[sort_order]
+    flux_sorted = flux_sub[sort_order, :]
+
+    unique_cells, cell_starts, cell_counts = np.unique(
+        flat_sorted, return_index=True, return_counts=True
+    )
+
+    # Allocate 2D (r, lon) arrays
+    shape_2d = (n_r, n_lon)
+    orbit_sample_count = np.zeros(shape_2d, dtype=np.int32)
+    dwell_time_sec = np.zeros(shape_2d, dtype=np.float64)
+    dwell_time_hours = np.zeros(shape_2d, dtype=np.float64)
+    mean_z_re = np.full(shape_2d, np.nan, dtype=np.float64)
+    std_z_re = np.full(shape_2d, np.nan, dtype=np.float64)
+
+    # Allocate 3D (r, lon, energy) arrays
+    shape_3d = (n_r, n_lon, n_energies)
+    valid_count = np.zeros(shape_3d, dtype=np.int32)
+    count_rate = np.full(shape_3d, np.nan, dtype=np.float64)
+    detection_ratio = np.full(shape_3d, np.nan, dtype=np.float64)
+
+    flux_mean = np.full(shape_3d, np.nan, dtype=np.float64)
+    flux_std = np.full(shape_3d, np.nan, dtype=np.float64)
+    flux_sem = np.full(shape_3d, np.nan, dtype=np.float64)
+    flux_median = np.full(shape_3d, np.nan, dtype=np.float64)
+    flux_q25 = np.full(shape_3d, np.nan, dtype=np.float64)
+    flux_q75 = np.full(shape_3d, np.nan, dtype=np.float64)
+    flux_iqr = np.full(shape_3d, np.nan, dtype=np.float64)
+    flux_p10 = np.full(shape_3d, np.nan, dtype=np.float64)
+    flux_p90 = np.full(shape_3d, np.nan, dtype=np.float64)
+    flux_min = np.full(shape_3d, np.nan, dtype=np.float64)
+    flux_max = np.full(shape_3d, np.nan, dtype=np.float64)
+    flux_geom_mean = np.full(shape_3d, np.nan, dtype=np.float64)
+    flux_log10_mean = np.full(shape_3d, np.nan, dtype=np.float64)
+    flux_log10_std = np.full(shape_3d, np.nan, dtype=np.float64)
+    flux_cv = np.full(shape_3d, np.nan, dtype=np.float64)
+
+    number_flux_mean = np.full(shape_3d, np.nan, dtype=np.float64)
+    number_flux_std = np.full(shape_3d, np.nan, dtype=np.float64)
+
+    print(f"[Statistics] Aggregating {len(flat_sorted):,} valid records across "
+          f"{len(unique_cells):,} visited (r, lon) cells (total grid: {n_r} x {n_lon} = {n_r * n_lon})...")
+
+    # Iterate over visited (r, lon) cells
+    for c_idx, start, count in zip(unique_cells, cell_starts, cell_counts):
+        ir = int(c_idx // n_lon)
+        ilon = int(c_idx % n_lon)
+        end = start + count
+
+        orbit_sample_count[ir, ilon] = count
+        cell_dwell = float(np.sum(dt_sorted[start:end]))
+        dwell_time_sec[ir, ilon] = cell_dwell
+        dwell_time_hours[ir, ilon] = cell_dwell / 3600.0
+
+        z_slice = z_sorted[start:end]
+        valid_z = z_slice[np.isfinite(z_slice)]
+        if len(valid_z) > 0:
+            mean_z_re[ir, ilon] = float(np.mean(valid_z))
+            std_z_re[ir, ilon] = float(np.std(valid_z, ddof=1)) if len(valid_z) > 1 else 0.0
+
+        # Flux slice of shape (count, n_energies)
+        f_slice = flux_sorted[start:end, :].copy()
+        bad_f = (~np.isfinite(f_slice)) | (f_slice <= 0.0) | (f_slice >= 1e25)
+        f_slice[bad_f] = np.nan
+
+        n_val_vec = np.sum(~bad_f, axis=0)
+        valid_count[ir, ilon, :] = n_val_vec
+
+        if cell_dwell > 0:
+            count_rate[ir, ilon, :] = n_val_vec.astype(np.float64) / cell_dwell
+        if count > 0:
+            detection_ratio[ir, ilon, :] = n_val_vec.astype(np.float64) / float(count)
+
+        # Compute statistics for each energy channel with at least min_samples
+        for ie in range(n_energies):
+            nv = int(n_val_vec[ie])
+            if nv < min_samples:
+                continue
+
+            col = f_slice[:, ie]
+            v = col[~bad_f[:, ie]]
+
+            m_val = float(np.mean(v))
+            s_val = float(np.std(v, ddof=1)) if nv > 1 else 0.0
+            sem_val = s_val / np.sqrt(nv) if nv > 1 else 0.0
+
+            p10, q25, med, q75, p90 = np.percentile(v, [10.0, 25.0, 50.0, 75.0, 90.0])
+
+            log_v = np.log10(v)
+            log_m = float(np.mean(log_v))
+            log_s = float(np.std(log_v, ddof=1)) if nv > 1 else 0.0
+            g_mean = 10.0 ** log_m
+
+            flux_mean[ir, ilon, ie] = m_val
+            flux_std[ir, ilon, ie] = s_val
+            flux_sem[ir, ilon, ie] = sem_val
+            flux_median[ir, ilon, ie] = float(med)
+            flux_q25[ir, ilon, ie] = float(q25)
+            flux_q75[ir, ilon, ie] = float(q75)
+            flux_iqr[ir, ilon, ie] = float(q75 - q25)
+            flux_p10[ir, ilon, ie] = float(p10)
+            flux_p90[ir, ilon, ie] = float(p90)
+            flux_min[ir, ilon, ie] = float(np.min(v))
+            flux_max[ir, ilon, ie] = float(np.max(v))
+            flux_geom_mean[ir, ilon, ie] = g_mean
+            flux_log10_mean[ir, ilon, ie] = log_m
+            flux_log10_std[ir, ilon, ie] = log_s
+            flux_cv[ir, ilon, ie] = (s_val / m_val) if m_val > 0 else np.nan
+
+            # Differential Number Flux J_N = DEF / E_keV [1/(cm^2 s sr keV)]
+            e_kev = energies[ie]
+            if e_kev > 0:
+                number_flux_mean[ir, ilon, ie] = m_val / e_kev
+                number_flux_std[ir, ilon, ie] = s_val / e_kev
+
+    # Time span metadata
+    valid_t = time_sec[np.isfinite(time_sec)]
+    t_start_unix = float(np.min(valid_t)) if len(valid_t) > 0 else 0.0
+    t_end_unix = float(np.max(valid_t)) if len(valid_t) > 0 else 0.0
+
+    return {
+        'r_center': r_center,
+        'r_edge_low': r_edge_low,
+        'r_edge_high': r_edge_high,
+        'r_edges': r_edges,
+        'lon_center': lon_center,
+        'lon_edge_low': lon_edge_low,
+        'lon_edge_high': lon_edge_high,
+        'lon_edges': lon_edges,
+        'lt_center': lt_center,
+        'lt_edges': lt_edges,
+        'gse_lon_center': gse_lon_center,
+        'bin_area_re2': bin_area_re2,
+        'energy': energies,
+        'orbit_sample_count': orbit_sample_count,
+        'dwell_time_sec': dwell_time_sec,
+        'dwell_time_hours': dwell_time_hours,
+        'mean_z_re': mean_z_re,
+        'std_z_re': std_z_re,
+        'valid_count': valid_count,
+        'count_rate': count_rate,
+        'detection_ratio': detection_ratio,
+        'flux_mean': flux_mean,
+        'flux_std': flux_std,
+        'flux_sem': flux_sem,
+        'flux_median': flux_median,
+        'flux_q25': flux_q25,
+        'flux_q75': flux_q75,
+        'flux_iqr': flux_iqr,
+        'flux_p10': flux_p10,
+        'flux_p90': flux_p90,
+        'flux_min': flux_min,
+        'flux_max': flux_max,
+        'flux_geom_mean': flux_geom_mean,
+        'flux_log10_mean': flux_log10_mean,
+        'flux_log10_std': flux_log10_std,
+        'flux_cv': flux_cv,
+        'number_flux_mean': number_flux_mean,
+        'number_flux_std': number_flux_std,
+        'dr': float(dr),
+        'dlon': float(dlon),
+        'r_min': float(r_min),
+        'r_max': float(r_edges[-1]),
+        'coord': data['coord'],
+        'probe': data['probe'],
+        'time_start_unix': t_start_unix,
+        'time_end_unix': t_end_unix,
+        'total_input_records': int(n_times),
+    }
+
+
+def save_stats_to_netcdf(stats, output_nc_path, input_nc_path=''):
+    """
+    Writes the computed 2D/3D spatial statistical arrays and metadata to a NetCDF (.nc) file.
+    """
+    out_dir = os.path.dirname(os.path.abspath(output_nc_path))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    n_r = len(stats['r_center'])
+    n_lon = len(stats['lon_center'])
+    n_energies = len(stats['energy'])
+
+    dt0 = datetime.datetime.fromtimestamp(stats['time_start_unix'], tz=datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+    dt1 = datetime.datetime.fromtimestamp(stats['time_end_unix'], tz=datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+
+    var_specs_1d = [
+        ('r', 'r', stats['r_center'], 'R_E', 'Radial distance bin center'),
+        ('r_edge_low', 'r', stats['r_edge_low'], 'R_E', 'Radial distance bin lower edge'),
+        ('r_edge_high', 'r', stats['r_edge_high'], 'R_E', 'Radial distance bin upper edge'),
+        ('r_edges', 'r_edge', stats['r_edges'], 'R_E', 'Radial distance bin edges (N_r + 1)'),
+        ('lon', 'lon', stats['lon_center'], 'degrees', 'Azimuthal longitude bin center (0 deg = 00 LT Midnight, 90 deg = 06 LT Dawn, 180 deg = 12 LT Noon, 270 deg = 18 LT Dusk)'),
+        ('lon_edge_low', 'lon', stats['lon_edge_low'], 'degrees', 'Azimuthal longitude bin lower edge [0, 360)'),
+        ('lon_edge_high', 'lon', stats['lon_edge_high'], 'degrees', 'Azimuthal longitude bin upper edge (0, 360]'),
+        ('lon_edges', 'lon_edge', stats['lon_edges'], 'degrees', 'Azimuthal longitude bin edges (N_lon + 1)'),
+        ('lt', 'lon', stats['lt_center'], 'hours', 'Local Time / MLT bin center [0, 24) hours'),
+        ('lt_edges', 'lon_edge', stats['lt_edges'], 'hours', 'Local Time / MLT bin edges [0, 24] hours'),
+        ('gse_lon', 'lon', stats['gse_lon_center'], 'degrees', 'Standard GSE/GSM longitude from +X axis (0 deg = Noon/+X, 90 deg = Dusk/+Y, 180 deg = Tail/-X, 270 deg = Dawn/-Y)'),
+        ('energy', 'energy', stats['energy'], 'keV', 'Ion energy channel center'),
+    ]
+
+    var_specs_2d = [
+        ('bin_area_re2', ('r', 'lon'), 'f8', stats['bin_area_re2'], 'R_E^2', 'Equatorial spatial area of each (r, lon) bin'),
+        ('orbit_sample_count', ('r', 'lon'), 'i4', stats['orbit_sample_count'], 'counts', 'Total number of spacecraft FPI timestamp records in bin'),
+        ('dwell_time_sec', ('r', 'lon'), 'f8', stats['dwell_time_sec'], 'seconds', 'Total spacecraft residence / dwell time in bin'),
+        ('dwell_time_hours', ('r', 'lon'), 'f8', stats['dwell_time_hours'], 'hours', 'Total spacecraft residence / dwell time in bin [hours]'),
+        ('mean_z_re', ('r', 'lon'), 'f8', stats['mean_z_re'], 'R_E', 'Mean spacecraft Z position in bin'),
+        ('std_z_re', ('r', 'lon'), 'f8', stats['std_z_re'], 'R_E', 'Standard deviation of spacecraft Z position in bin'),
+    ]
+
+    flux_unit = 'keV/(cm^2 s sr keV)'
+    nflux_unit = '1/(cm^2 s sr keV)'
+
+    var_specs_3d = [
+        ('flux_mean', ('r', 'lon', 'energy'), 'f8', stats['flux_mean'], flux_unit, 'Arithmetic mean of ion Differential Energy Flux (DEF)'),
+        ('flux_std', ('r', 'lon', 'energy'), 'f8', stats['flux_std'], flux_unit, 'Sample standard deviation (ddof=1) of ion DEF'),
+        ('flux_sem', ('r', 'lon', 'energy'), 'f8', stats['flux_sem'], flux_unit, 'Standard Error of the Mean (SEM = std / sqrt(valid_count)) of ion DEF'),
+        ('flux_median', ('r', 'lon', 'energy'), 'f8', stats['flux_median'], flux_unit, 'Median (50th percentile) of ion DEF'),
+        ('flux_q25', ('r', 'lon', 'energy'), 'f8', stats['flux_q25'], flux_unit, '25th percentile (first quartile) of ion DEF'),
+        ('flux_q75', ('r', 'lon', 'energy'), 'f8', stats['flux_q75'], flux_unit, '75th percentile (third quartile) of ion DEF'),
+        ('flux_iqr', ('r', 'lon', 'energy'), 'f8', stats['flux_iqr'], flux_unit, 'Interquartile range (Q75 - Q25) of ion DEF'),
+        ('flux_p10', ('r', 'lon', 'energy'), 'f8', stats['flux_p10'], flux_unit, '10th percentile of ion DEF'),
+        ('flux_p90', ('r', 'lon', 'energy'), 'f8', stats['flux_p90'], flux_unit, '90th percentile of ion DEF'),
+        ('flux_min', ('r', 'lon', 'energy'), 'f8', stats['flux_min'], flux_unit, 'Minimum valid ion DEF observed in bin'),
+        ('flux_max', ('r', 'lon', 'energy'), 'f8', stats['flux_max'], flux_unit, 'Maximum valid ion DEF observed in bin'),
+        ('flux_geom_mean', ('r', 'lon', 'energy'), 'f8', stats['flux_geom_mean'], flux_unit, 'Geometric mean of ion DEF (10^mean(log10(DEF)))'),
+        ('flux_log10_mean', ('r', 'lon', 'energy'), 'f8', stats['flux_log10_mean'], 'log10(keV/(cm^2 s sr keV))', 'Arithmetic mean of log10(DEF)'),
+        ('flux_log10_std', ('r', 'lon', 'energy'), 'f8', stats['flux_log10_std'], 'log10(keV/(cm^2 s sr keV))', 'Sample standard deviation of log10(DEF)'),
+        ('flux_cv', ('r', 'lon', 'energy'), 'f8', stats['flux_cv'], 'dimensionless', 'Coefficient of variation (flux_std / flux_mean)'),
+        ('valid_count', ('r', 'lon', 'energy'), 'i4', stats['valid_count'], 'counts', 'Number of valid positive flux measurements in bin'),
+        ('count_rate', ('r', 'lon', 'energy'), 'f8', stats['count_rate'], 'counts/s', 'Valid flux measurement acquisition rate (valid_count / dwell_time_sec)'),
+        ('detection_ratio', ('r', 'lon', 'energy'), 'f8', stats['detection_ratio'], 'dimensionless', 'Fraction of spacecraft records in bin with valid positive flux (valid_count / orbit_sample_count)'),
+        ('number_flux_mean', ('r', 'lon', 'energy'), 'f8', stats['number_flux_mean'], nflux_unit, 'Arithmetic mean of Differential Number Flux (J_N = DEF / E)'),
+        ('number_flux_std', ('r', 'lon', 'energy'), 'f8', stats['number_flux_std'], nflux_unit, 'Sample standard deviation of Differential Number Flux (J_N = DEF / E)'),
+    ]
+
+    if HAS_NETCDF4:
+        print(f"[NetCDF] Writing statistical dataset to {output_nc_path} (format: NETCDF4)...")
+        with nc.Dataset(output_nc_path, 'w', format='NETCDF4') as ds:
+            ds.title = f"{stats['probe']} FPI Ion Flux 2D Spatial Statistics (dr={stats['dr']} R_E, dlon={stats['dlon']} deg)"
+            ds.spacecraft = stats['probe']
+            ds.coordinate_system = stats['coord']
+            ds.source_file = os.path.basename(input_nc_path) if input_nc_path else 'unknown'
+            ds.time_coverage_start = dt0
+            ds.time_coverage_end = dt1
+            ds.dr_re = stats['dr']
+            ds.dlon_deg = stats['dlon']
+            ds.r_min_re = stats['r_min']
+            ds.r_max_re = stats['r_max']
+            ds.total_input_records = stats['total_input_records']
+            ds.created = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+            ds.createDimension('r', n_r)
+            ds.createDimension('r_edge', n_r + 1)
+            ds.createDimension('lon', n_lon)
+            ds.createDimension('lon_edge', n_lon + 1)
+            ds.createDimension('energy', n_energies)
+
+            for vname, dim_name, arr, units, desc in var_specs_1d:
+                v = ds.createVariable(vname, 'f8', (dim_name,), zlib=True, complevel=4)
+                v.units = units
+                v.long_name = desc
+                v[:] = arr
+
+            for vname, dims, dtype, arr, units, desc in var_specs_2d:
+                v = ds.createVariable(vname, dtype, dims, zlib=True, complevel=4)
+                v.units = units
+                v.long_name = desc
+                v[:] = arr
+
+            for vname, dims, dtype, arr, units, desc in var_specs_3d:
+                v = ds.createVariable(vname, dtype, dims, zlib=True, complevel=4)
+                v.units = units
+                v.long_name = desc
+                v[:] = arr
+
+            # Also write convenient per-energy 2D slices for mean, std, and count_rate
+            for ie, e_val in enumerate(stats['energy']):
+                etag = f"E{ie+1:02d}_{str(e_val).replace('.', 'p')}keV"
+                v_m = ds.createVariable(f"flux_mean_{etag}", 'f8', ('r', 'lon'), zlib=True, complevel=4)
+                v_m.units = flux_unit
+                v_m.long_name = f"Mean DEF at {e_val} keV"
+                v_m[:] = stats['flux_mean'][:, :, ie]
+
+                v_s = ds.createVariable(f"flux_std_{etag}", 'f8', ('r', 'lon'), zlib=True, complevel=4)
+                v_s.units = flux_unit
+                v_s.long_name = f"Std DEF at {e_val} keV"
+                v_s[:] = stats['flux_std'][:, :, ie]
+    else:
+        print(f"[NetCDF] Writing statistical dataset to {output_nc_path} (format: NETCDF3 via scipy)...")
+        with netcdf_file(output_nc_path, 'w') as ds:
+            ds.title = f"{stats['probe']} FPI Ion Flux 2D Spatial Statistics (dr={stats['dr']} R_E, dlon={stats['dlon']} deg)"
+            ds.spacecraft = stats['probe']
+            ds.coordinate_system = stats['coord']
+            ds.source_file = os.path.basename(input_nc_path) if input_nc_path else 'unknown'
+            ds.time_coverage_start = dt0
+            ds.time_coverage_end = dt1
+            ds.dr_re = stats['dr']
+            ds.dlon_deg = stats['dlon']
+            ds.r_min_re = stats['r_min']
+            ds.r_max_re = stats['r_max']
+            ds.total_input_records = stats['total_input_records']
+            ds.created = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+            ds.createDimension('r', n_r)
+            ds.createDimension('r_edge', n_r + 1)
+            ds.createDimension('lon', n_lon)
+            ds.createDimension('lon_edge', n_lon + 1)
+            ds.createDimension('energy', n_energies)
+
+            for vname, dim_name, arr, units, desc in var_specs_1d:
+                v = ds.createVariable(vname, 'f8', (dim_name,))
+                v.units = units
+                v.long_name = desc
+                v[:] = arr
+
+            for vname, dims, dtype, arr, units, desc in var_specs_2d:
+                v = ds.createVariable(vname, dtype, dims)
+                v.units = units
+                v.long_name = desc
+                v[:] = arr
+
+            for vname, dims, dtype, arr, units, desc in var_specs_3d:
+                v = ds.createVariable(vname, dtype, dims)
+                v.units = units
+                v.long_name = desc
+                v[:] = arr
+
+            for ie, e_val in enumerate(stats['energy']):
+                etag = f"E{ie+1:02d}_{str(e_val).replace('.', 'p')}keV"
+                v_m = ds.createVariable(f"flux_mean_{etag}", 'f8', ('r', 'lon'))
+                v_m.units = flux_unit
+                v_m.long_name = f"Mean DEF at {e_val} keV"
+                v_m[:] = stats['flux_mean'][:, :, ie]
+
+                v_s = ds.createVariable(f"flux_std_{etag}", 'f8', ('r', 'lon'))
+                v_s.units = flux_unit
+                v_s.long_name = f"Std DEF at {e_val} keV"
+                v_s[:] = stats['flux_std'][:, :, ie]
+
+    print(f"[NetCDF] Successfully saved statistical NetCDF file: {output_nc_path}")
+    print(f"         Grid shape : (n_r={n_r}, n_lon={n_lon}, n_energy={n_energies})")
+    print(f"         Radial bins: [{stats['r_min']:.1f}, {stats['r_max']:.1f}] R_E (dr = {stats['dr']} R_E)")
+    print(f"         Angle bins : [0.0, 360.0] deg (dlon = {stats['dlon']} deg, {24.0 / n_lon:.2f} LT hours/bin)")
+    print(f"         Time range : {dt0} to {dt1}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Compute 2D (r, lon) binned statistics of MMS FPI ion flux for publication and save to NetCDF."
+    )
+    parser.add_argument('--input', '-i', type=str, default='mms1_fpi_orbit_20250101_20251231.nc',
+                        help="Input orbit & flux NetCDF file (default: mms1_fpi_orbit_20250101_20251231.nc).")
+    parser.add_argument('--output', '-o', type=str, default=None,
+                        help="Output statistical NetCDF file path (default: auto-generated from input name).")
+    parser.add_argument('--dr', type=float, default=0.5,
+                        help="Radial bin width in R_E (default: 0.5).")
+    parser.add_argument('--dlon', type=float, default=10.0,
+                        help="Azimuthal longitude bin width in degrees (default: 10.0).")
+    parser.add_argument('--r-min', type=float, default=0.0,
+                        help="Minimum radial distance in R_E (default: 0.0).")
+    parser.add_argument('--r-max', type=float, default=None,
+                        help="Maximum radial distance in R_E (default: auto-detected from data apogee).")
+    parser.add_argument('--min-samples', type=int, default=1,
+                        help="Minimum valid samples per bin required to report statistics (default: 1).")
+
+    args = parser.parse_args()
+
+    if args.output is None:
+        base = os.path.splitext(os.path.basename(args.input))[0]
+        dr_str = str(args.dr).replace('.', 'p')
+        dlon_str = str(int(args.dlon) if args.dlon == int(args.dlon) else args.dlon).replace('.', 'p')
+        out_nc = f"{base}_stats_dr{dr_str}Re_dlon{dlon_str}deg.nc"
+    else:
+        out_nc = args.output
+
+    print("=" * 78)
+    print(" MMS FPI Ion Flux 2D Spatial Statistics Generator")
+    print(f" Input File  : {args.input}")
+    print(f" Output File : {out_nc}")
+    print(f" Grid Spec   : dr = {args.dr} R_E, dlon = {args.dlon} deg (min_samples = {args.min_samples})")
+    print("=" * 78)
+
+    data = read_input_orbit_nc(args.input)
+    print(f"[Reader] Loaded {len(data['time']):,} records across {len(data['energy'])} energy channels.")
+
+    stats = compute_2d_spatial_statistics(
+        data=data,
+        dr=args.dr,
+        dlon=args.dlon,
+        r_min=args.r_min,
+        r_max=args.r_max,
+        min_samples=args.min_samples
+    )
+
+    save_stats_to_netcdf(stats, out_nc, input_nc_path=args.input)
+
+
+if __name__ == '__main__':
+    main()
