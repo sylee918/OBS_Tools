@@ -574,7 +574,7 @@ def plot_themis_esa_and_orbit(data_dict,
                               noon_loc='top',
                               point_size=None,
                               step=None,
-                              max_orbit_points=3000,
+                              max_orbit_points=None,
                               output_path='themis_esa_ion_orbit.png',
                               dpi=300):
     """
@@ -616,10 +616,17 @@ def plot_themis_esa_and_orbit(data_dict,
     # Downsample Orbit Points for High-Performance Rendering (듬성듬성 그리기)
     # -------------------------------------------------------------------------
     n_total_pts = len(lt)
+    n_days = max(1.0, total_hours / 24.0)
+    if max_orbit_points is not None:
+        effective_max = max_orbit_points
+    else:
+        # Dynamically scale ~100 points/day (~100 pts/orbit), clamped between 3,000 and 45,000
+        effective_max = int(np.clip(n_days * 100, 3000, 45000))
+
     if step is not None and step > 1:
         stride = int(step)
-    elif max_orbit_points is not None and n_total_pts > max_orbit_points:
-        stride = int(np.ceil(n_total_pts / max_orbit_points))
+    elif n_total_pts > effective_max:
+        stride = int(np.ceil(n_total_pts / effective_max))
     else:
         stride = 1
 
@@ -822,9 +829,23 @@ def plot_themis_esa_and_orbit(data_dict,
     if point_size is not None:
         pt_size = point_size
     else:
-        pt_size = 4.0 if n_pts <= 2000 else (2.5 if n_pts <= 5000 else 1.2)
+        if n_pts <= 3000:
+            pt_size = 3.5
+        elif n_pts <= 10000:
+            pt_size = 2.0
+        elif n_pts <= 25000:
+            pt_size = 1.2
+        else:
+            pt_size = 0.6
 
-    pt_alpha = 0.85 if n_pts <= 3000 else 0.70
+    if n_pts <= 3000:
+        pt_alpha = 0.85
+    elif n_pts <= 15000:
+        pt_alpha = 0.70
+    elif n_pts <= 30000:
+        pt_alpha = 0.55
+    else:
+        pt_alpha = 0.40
 
     sc = ax2.scatter(theta, r_orbit, c=flux_slice, cmap=cmap, norm=norm,
                      s=pt_size, alpha=pt_alpha, edgecolors='none', zorder=3,
@@ -942,9 +963,9 @@ def main():
     parser.add_argument('--point-size', type=float, default=None,
                         help="Custom scatter point size for the polar orbit plot curve (e.g., 0.8, 1.2, 2.0).")
     parser.add_argument('--step', type=int, default=None,
-                        help="Step/stride to downsample orbit points (e.g. --step 5 draws every 5th point). Default: auto-downsamples to ~3000 points.")
-    parser.add_argument('--max-orbit-points', type=int, default=3000,
-                        help="Maximum points to render on polar orbit plot (default: 3000 for ultra-fast rendering).")
+                        help="Step/stride to downsample orbit points (e.g. --step 5 draws every 5th point). Default: auto-downsamples based on duration.")
+    parser.add_argument('--max-orbit-points', type=int, default=None,
+                        help="Maximum points to render on polar orbit plot (default: dynamic ~100 pts/day, 3000-45000).")
     parser.add_argument('--download', action='store_true',
                         help="Auto-download missing CDF files if not cached locally.")
     parser.add_argument('--data-dir', type=str, default=None,
@@ -965,13 +986,14 @@ def main():
     else:
         out_name = args.output
 
+    pts_str = f"{args.max_orbit_points}" if args.max_orbit_points is not None else "Dynamic (~100 pts/day, 3k-45k)"
     print("=" * 78)
     print(f"THEMIS-{probe.upper()} ESA Ion Spectrogram & Polar Orbit Trajectory Analysis")
     print(f"Time Range : {dt_start.strftime('%Y-%m-%d %H:%M:%S')} to {dt_end.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Calendar Days : {len(calendar_dates)} day(s) -> {calendar_dates[0]} to {calendar_dates[-1]}")
     print(f"Coordinates: {args.coord.upper()} | Energy Slice: {args.energy:.2f} keV | ESA Mode: {args.mode}")
     print(f"Noon Axis  : {args.noon.capitalize()} | Output: {out_name}")
-    print(f"Fast Render: Orbit Points Max={args.max_orbit_points} | Step={args.step if args.step else 'Auto'}")
+    print(f"Fast Render: Orbit Points Max={pts_str} | Step={args.step if args.step else 'Auto'}")
     print("=" * 78)
 
     # 1. Rapidly discover local CDF files (or download if explicitly enabled)
