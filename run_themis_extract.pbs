@@ -1,0 +1,39 @@
+#PBS -S /bin/bash
+#PBS -N tha_esa_nc
+#PBS -l select=1:ncpus=36:mem=50GB
+#PBS -l walltime=02:00:00
+#PBS -q ldan
+#PBS -j oe
+#PBS -o tha_nc_extract.log
+#PBS -m abe
+
+### Move to submission directory
+cd $PBS_O_WORKDIR
+
+echo "=========================================================="
+echo "Job started on $(hostname) at $(date)"
+echo "Working directory: $PBS_O_WORKDIR"
+echo "=========================================================="
+
+### Ensure unbuffered output so logs appear in real-time
+export PYTHONUNBUFFERED=1
+
+### 1. Extract 1-year THEMIS-A ESA & State CDFs to Orbit NetCDF with 36 CPU workers
+python3 -u save_themis_esa_proton_orbit_nc_parallel.py \
+    --probe a \
+    --date 2018-01-01 2018-12-31 \
+    --coord gse \
+    --workers 36 \
+    --output tha_esa_orbit_20180101_20181231.nc
+
+### 2. Compute 2D spatial statistics (dr=0.5 R_E, dlon=10 deg) for publication
+python3 -u save_themis_esa_proton_stats_nc.py \
+    --input tha_esa_orbit_20180101_20181231.nc \
+    --dr 0.5 \
+    --dlon 10 \
+    --output tha_esa_orbit_20180101_20181231_stats_dr0p5Re_dlon10deg.nc
+
+echo "=========================================================="
+echo "Job finished at $(date)"
+echo "=========================================================="
+

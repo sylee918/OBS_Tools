@@ -250,7 +250,7 @@ def extract_flux_at_energy(energy_eV, flux_2d, target_energy_eV):
         return flux_target
 
     # 2D energy table: Group by unique energy rows (typically 2-4 distinct tables across a full year)
-    e_round = np.round(energy_eV, decimals=2)
+    e_round = np.where(np.isfinite(energy_eV) & (energy_eV > 0), np.round(energy_eV, decimals=2), -1.0)
     unique_e, inverse_indices = np.unique(e_round, axis=0, return_inverse=True)
 
     if len(unique_e) < 50:
